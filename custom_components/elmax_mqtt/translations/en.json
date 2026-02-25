@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Elmax MQTT",
+        "description": "Connect to your Elmax panel via local MQTT broker.",
+        "data": {
+          "panel_id": "Panel ID",
+          "panel_pin": "PIN",
+          "panel_host": "Panel IP Address"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to panel. Verify PIN, MQTT broker, and that the panel is online."
+    },
+    "abort": {
+      "already_configured": "This panel is already configured."
+    }
+  }
+}
