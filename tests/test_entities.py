@@ -4,7 +4,12 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock
 
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+
 from custom_components.elmax_local.alarm_control_panel import ElmaxAlarmPanel
+from custom_components.elmax_local.binary_sensor import (
+    ElmaxZoneSensor, _infer_device_class,
+)
 from custom_components.elmax_local.coordinator import ElmaxLocalCoordinator
 
 
@@ -39,3 +44,20 @@ async def test_alarm_panel_disarm_uses_pin(coord_with_data):
     coord_with_data.async_send_command.assert_called_with(
         "abc123-area-0", "0", code="000000"
     )
+
+
+def test_infer_device_class_porta():
+    assert _infer_device_class("Porta Ingresso") == BinarySensorDeviceClass.DOOR
+
+
+def test_infer_device_class_finestra():
+    assert _infer_device_class("Finestra Cucina") == BinarySensorDeviceClass.WINDOW
+
+
+def test_infer_device_class_default():
+    assert _infer_device_class("Sensore Salotto") == BinarySensorDeviceClass.MOTION
+
+
+def test_zone_is_on(coord_with_data):
+    zone = ElmaxZoneSensor(coord_with_data, "abc123-zona-0")
+    assert zone.is_on is False  # aperta=False in mock_panel_data
