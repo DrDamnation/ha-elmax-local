@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+from ipaddress import ip_address
+
 from aioresponses import aioresponses
+from homeassistant.components.zeroconf import ZeroconfServiceInfo
 from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.elmax_local.const import DOMAIN
@@ -65,3 +68,16 @@ async def test_user_step_panel_id_mismatch(hass):
             )
         assert result["type"] == FlowResultType.FORM
         assert result["errors"] == {"base": "panel_id_mismatch"}
+
+
+async def test_zeroconf_step(hass):
+    info = ZeroconfServiceInfo(
+        ip_address=ip_address("1.2.3.4"), ip_addresses=[ip_address("1.2.3.4")],
+        port=443, hostname="elmax-abc.local.", type="_elmax-ssl._tcp.local.",
+        name="Elmax abc._elmax-ssl._tcp.local.", properties={},
+    )
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": "zeroconf"}, data=info
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "user"

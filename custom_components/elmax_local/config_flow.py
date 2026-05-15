@@ -10,6 +10,7 @@ import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components import mqtt
+from homeassistant.components.zeroconf import ZeroconfServiceInfo
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
@@ -60,6 +61,16 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             })
 
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+    async def async_step_zeroconf(self, discovery_info: ZeroconfServiceInfo) -> FlowResult:
+        host = str(discovery_info.ip_address)
+        self.context["host"] = host
+        schema = vol.Schema({
+            vol.Required(CONF_PANEL_HOST, default=host): str,
+            vol.Required(CONF_PANEL_ID): str,
+            vol.Required(CONF_PANEL_PIN): str,
+        })
+        return self.async_show_form(step_id="user", data_schema=schema)
 
     async def async_step_import(self, import_data: dict[str, Any]) -> FlowResult:
         """Invocato dal migration service. Bypassa validazione interattiva."""
