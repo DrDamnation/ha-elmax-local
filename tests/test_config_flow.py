@@ -6,7 +6,10 @@ from unittest.mock import patch
 from ipaddress import ip_address
 
 from aioresponses import aioresponses
-from homeassistant.components.zeroconf import ZeroconfServiceInfo
+try:
+    from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
+except ImportError:
+    from homeassistant.components.zeroconf import ZeroconfServiceInfo  # type: ignore[no-redef]
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
