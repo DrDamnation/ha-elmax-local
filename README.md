@@ -161,6 +161,47 @@ Where `XXXXXX` is the last 6 characters of your panel ID. You can rename entitie
 | Phantom64 PRO GSM | Yes | Full support |
 | Other Elmax panels | Unknown | Should work if MQTT is supported |
 
+## v2.0 — Migration from elmax_mqtt
+
+Version 2.0 renames the integration to **`elmax_local`** and rebuilds the
+architecture around push-first multi-transport (WebSocket + MQTT + HTTP).
+See the [implementation plan](docs/superpowers/plans/2026-05-15-elmax-local-refactor.md)
+and [design spec](docs/superpowers/specs/2026-05-15-elmax-local-refactor-design.md)
+for full background.
+
+### What changed
+- Domain renamed `elmax_mqtt` → `elmax_local`. Entity `unique_id` prefix
+  follows the same rename.
+- New `WebSocketTransport` (`wss://IP/api/v2/push`, fw VideoBox ≥ 4.11) for
+  real-time push.
+- `MqttTransport` now forwards spontaneous `200 Status Update` messages as
+  push events (the v1 implementation treated MQTT only as a polling channel).
+- Entities inherit from `CoordinatorEntity` — proper HA lifecycle, derived
+  availability, no custom dispatcher.
+- JWT auth parses the real `exp` claim and applies exponential backoff on
+  401/403 to prevent the panel's "Codice Falso Da PcIP" lockout.
+- Option `scan_interval` was renamed to `reconcile_interval` (default raised
+  to 90s now that push handles real-time updates).
+
+### How to migrate
+1. Install `elmax_local` from HACS (alongside the existing `elmax_mqtt`).
+   You do **not** need to remove `elmax_mqtt` first — migration moves the
+   existing config entry and entity registry over.
+2. In **Developer Tools → Services**, run `elmax_local.migrate_from_legacy`.
+   This creates a JSON backup in `<config>/.storage/elmax_local_migration_backup_*.json`
+   before rewriting the entity/device registries and creating the new config
+   entry.
+3. Restart Home Assistant.
+4. After verifying the new entities work as expected, you can remove the
+   `elmax_mqtt` custom component from `custom_components/`.
+
+### Rollback
+If something goes wrong, run `elmax_local.rollback_migration`. This rewrites
+the entities back to the `elmax_mqtt` platform using the most recent backup.
+You will then need to re-add the `elmax_mqtt` integration manually from the
+HA UI (HA does not allow reconstructing a removed config entry with the
+original `entry_id`). The backup file is preserved for audit.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
