@@ -1,6 +1,7 @@
 """ElmaxLocalCoordinator — orchestrates transports and updates entities."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from .transport.websocket import WebSocketTransport
 _LOGGER = logging.getLogger(__name__)
 
 PUSH_FRESHNESS_RATIO = 0.5  # skip poll if push < interval*0.5 ago
+POST_COMMAND_WAIT = 3
 
 
 @dataclass
@@ -120,3 +122,24 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
             return False
         elapsed = time.time() - self.data.last_update_ts
         return elapsed < self.update_interval.total_seconds() * PUSH_FRESHNESS_RATIO
+
+    async def async_send_command(
+        self,
+        endpoint_id: str,
+        cmd: str | None,
+        code: str | None = None,
+    ) -> bool:
+        result = await self.registry.async_send_command(endpoint_id, cmd, code)
+        if result.ok:
+            self.hass.async_create_task(self._post_command_verify())
+        else:
+            _LOGGER.warning("Command %s/%s failed: %s",
+                            endpoint_id, cmd, result.error)
+        return result.ok
+
+    async def _post_command_verify(self) -> None:
+        """Wait briefly for a push; if none, force reconcile."""
+        await asyncio.sleep(POST_COMMAND_WAIT)
+        if (self.data is None
+                or (time.time() - self.data.last_update_ts) > POST_COMMAND_WAIT):
+            await self.async_request_refresh()

@@ -1,12 +1,14 @@
 """Test ElmaxLocalCoordinator."""
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from custom_components.elmax_local.coordinator import (
     ElmaxLocalCoordinator, ElmaxState,
 )
+from custom_components.elmax_local.transport import CommandResult
 
 
 def test_state_dataclass_defaults():
@@ -53,3 +55,27 @@ async def test_update_data_skips_when_push_fresh(hass, mock_panel_data):
         result = await coord._async_update_data()
         mock_fetch.assert_not_called()
         assert result is coord.data
+
+
+async def test_send_command_schedules_verify(hass):
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4")
+    with patch.object(coord.registry, "async_send_command",
+                      new=AsyncMock(return_value=CommandResult(ok=True))):
+        with patch.object(coord, "_post_command_verify",
+                          new=AsyncMock()) as mock_verify:
+            ok = await coord.async_send_command("eid", "4")
+            assert ok is True
+            await asyncio.sleep(0)
+            mock_verify.assert_called()
+
+
+async def test_send_command_fail_no_verify(hass):
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4")
+    with patch.object(coord.registry, "async_send_command",
+                      new=AsyncMock(return_value=CommandResult(ok=False))):
+        with patch.object(coord, "_post_command_verify",
+                          new=AsyncMock()) as mock_verify:
+            ok = await coord.async_send_command("eid", "4")
+            assert ok is False
+            await asyncio.sleep(0)
+            mock_verify.assert_not_called()
