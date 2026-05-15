@@ -83,7 +83,7 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         'centrale' (panel_id). Host is not exposed via this topic, so
         callers must still ask the user for the IP."""
         try:
-            if not mqtt.async_wait_for_mqtt_client(self.hass):
+            if not await mqtt.async_wait_for_mqtt_client(self.hass):
                 return []
         except Exception:
             return []

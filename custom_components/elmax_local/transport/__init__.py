@@ -107,6 +107,10 @@ class TransportRegistry:
         on_state_update: StateUpdateCallback,
     ) -> None:
         for t in self._transports:
+            # Give the transport access to AuthManager *before* probing, since
+            # HTTP/WS probes hit /login which goes through auth. Probe must be
+            # callable before async_start sets up listeners.
+            t._auth = auth  # noqa: SLF001 — intentional contract per Registry
             try:
                 ok = await t.async_probe()
                 if ok:
