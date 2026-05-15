@@ -161,6 +161,70 @@ Where `XXXXXX` is the last 6 characters of your panel ID. You can rename entitie
 | Phantom64 PRO GSM | Yes | Full support |
 | Other Elmax panels | Unknown | Should work if MQTT is supported |
 
+## v2.0 — Migration from elmax_mqtt
+
+Version 2.0 renames the integration to **`elmax_local`** and rebuilds the
+architecture around push-first multi-transport (WebSocket + MQTT + HTTP).
+See the [implementation plan](docs/superpowers/plans/2026-05-15-elmax-local-refactor.md)
+and [design spec](docs/superpowers/specs/2026-05-15-elmax-local-refactor-design.md)
+for full background.
+
+### What changed
+- Domain renamed `elmax_mqtt` → `elmax_local`. Entity `unique_id` prefix
+  follows the same rename.
+- New `WebSocketTransport` (`wss://IP/api/v2/push`, fw VideoBox ≥ 4.11) for
+  real-time push.
+- `MqttTransport` now forwards spontaneous `200 Status Update` messages as
+  push events (the v1 implementation treated MQTT only as a polling channel).
+- Entities inherit from `CoordinatorEntity` — proper HA lifecycle, derived
+  availability, no custom dispatcher.
+- JWT auth parses the real `exp` claim and applies exponential backoff on
+  401/403 to prevent the panel's "Codice Falso Da PcIP" lockout.
+- Option `scan_interval` was renamed to `reconcile_interval` (default raised
+  to 90s now that push handles real-time updates).
+
+### How to migrate
+
+> **Note (HA 2025.x+):** the automated `elmax_local.migrate_from_legacy`
+> service is fragile on recent HA versions because
+> `entity_registry.async_update_entity_platform` rejects entities that still
+> have a state in the state machine (after unload HA marks them as
+> `unavailable` instead of removing). The robust manual procedure below
+> achieves the same result.
+
+**Manual migration (recommended):**
+
+1. Install `elmax_local` from HACS (alongside the existing `elmax_mqtt`).
+2. Add the `elmax_local` integration in **Settings → Devices & Services →
+   Add Integration → Elmax Local**. Enter the panel host + PIN; the panel_id
+   is derived automatically. The new entry creates entities with `_2`
+   suffixes because the original entity_ids are still owned by `elmax_mqtt`.
+3. Verify the new entities respond correctly to a few commands.
+4. Remove the `elmax_mqtt` config entry from the UI. This cascade-removes
+   its entity registry entries (Recorder history is **kept**).
+5. Rename each `elmax_local.*_2` entity to drop the `_2` suffix. From
+   **Settings → Devices & Services → Elmax Local → Entities**, click each
+   entity and edit its Entity ID. New writes go under the original entity_id
+   → Recorder history continues seamlessly from the `elmax_mqtt` era.
+6. Remove the `elmax_mqtt` custom component from `custom_components/`.
+
+**Automated service (best-effort, may fail on HA 2025+):**
+
+`elmax_local.migrate_from_legacy` creates a JSON backup in
+`<config>/.storage/elmax_local_migration_backup_*.json` and attempts the
+registry rewrite. If it succeeds, restart HA. If it fails partway through,
+the service auto-rolls back the registry rewrite but leaves the new
+`elmax_local` entry created — remove it manually and use the manual
+procedure above.
+
+### Rollback
+
+If something goes wrong, run `elmax_local.rollback_migration`. This rewrites
+the entities back to the `elmax_mqtt` platform using the most recent backup.
+You will then need to re-add the `elmax_mqtt` integration manually from the
+HA UI (HA does not allow reconstructing a removed config entry with the
+original `entry_id`). The backup file is preserved for audit.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

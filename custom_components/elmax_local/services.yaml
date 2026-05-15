@@ -1,0 +1,12 @@
+migrate_from_legacy:
+  name: Migra da elmax_mqtt
+  description: >
+    Migra una configurazione esistente dal legacy custom component
+    'elmax_mqtt' a 'elmax_local'. Crea backup automatico in .storage/
+    prima di procedere. Va eseguito UNA VOLTA. Richiede restart HA.
+
+rollback_migration:
+  name: Rollback migrazione
+  description: >
+    Ripristina lo stato pre-migrazione dal backup più recente in .storage/.
+    Usalo se la migrazione ha causato problemi. Richiede restart HA.

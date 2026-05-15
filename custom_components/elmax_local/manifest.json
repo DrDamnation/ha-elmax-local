@@ -1,0 +1,13 @@
+{
+  "domain": "elmax_local",
+  "name": "Elmax Local",
+  "brand": "elmax",
+  "codeowners": ["@dconvertini"],
+  "config_flow": true,
+  "dependencies": ["mqtt"],
+  "documentation": "https://github.com/dconvertini/ha-elmax-local",
+  "iot_class": "local_push",
+  "requirements": [],
+  "version": "2.0.0",
+  "zeroconf": ["_elmax-ssl._tcp.local."]
+}
