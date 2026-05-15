@@ -1,13 +1,13 @@
 {
   "planPath": "docs/superpowers/plans/2026-05-15-elmax-local-refactor.md",
   "tasks": [
-    {"id": 0, "subject": "Task 0: Test scaffolding", "status": "pending",
+    {"id": 0, "subject": "Task 0: Test scaffolding", "status": "completed",
      "description": "Setup pytest + pytest-homeassistant-custom-component. Files: tests/__init__.py, tests/conftest.py, requirements_test.txt, pytest.ini, .gitignore.\n\n```json:metadata\n{\"files\": [\"tests/__init__.py\", \"tests/conftest.py\", \"requirements_test.txt\", \"pytest.ini\", \".gitignore\"], \"verifyCommand\": \"pip install -r requirements_test.txt && pytest tests/ -v\", \"acceptanceCriteria\": [\"pytest installed\", \"pytest runs without crash\", \".gitignore excludes cache\"]}\n```"},
-    {"id": 1, "subject": "Task 1: Package scaffolding elmax_local", "status": "pending", "blockedBy": [0],
+    {"id": 1, "subject": "Task 1: Package scaffolding elmax_local", "status": "completed", "blockedBy": [0],
      "description": "Create custom_components/elmax_local/ with manifest.json, const.py, stub __init__.py.\n\n```json:metadata\n{\"files\": [\"custom_components/elmax_local/__init__.py\", \"custom_components/elmax_local/manifest.json\", \"custom_components/elmax_local/const.py\", \"tests/test_package.py\"], \"verifyCommand\": \"pytest tests/test_package.py -v\", \"acceptanceCriteria\": [\"manifest valid\", \"DOMAIN='elmax_local'\", \"3 tests pass\"]}\n```"},
-    {"id": 2, "subject": "Task 2: Transport ABC + enums + Registry skeleton", "status": "pending", "blockedBy": [1],
+    {"id": 2, "subject": "Task 2: Transport ABC + enums + Registry skeleton", "status": "completed", "blockedBy": [1],
      "description": "Define Transport ABC contract from spec sez. 5.\n\n```json:metadata\n{\"files\": [\"custom_components/elmax_local/transport/__init__.py\", \"tests/transport/__init__.py\", \"tests/transport/test_abc.py\"], \"verifyCommand\": \"pytest tests/transport/test_abc.py -v\", \"acceptanceCriteria\": [\"ABC not instantiable\", \"subclass instantiable\", \"defaults raise NotImplementedError\"]}\n```"},
-    {"id": 3, "subject": "Task 3: AuthManager", "status": "pending", "blockedBy": [1],
+    {"id": 3, "subject": "Task 3: AuthManager", "status": "completed", "blockedBy": [1],
      "description": "JWT login, refresh, parse_exp, exponential backoff.\n\n```json:metadata\n{\"files\": [\"custom_components/elmax_local/auth.py\", \"tests/test_auth.py\"], \"verifyCommand\": \"pytest tests/test_auth.py -v\", \"acceptanceCriteria\": [\"parse_exp valid/malformed\", \"login OK\", \"token cached\", \"refresh within margin\", \"handle_401 invalidates\", \"403 triggers backoff\"]}\n```"},
     {"id": 4, "subject": "Task 4: HttpTransport", "status": "pending", "blockedBy": [2, 3],
      "description": "POLL + COMMAND. Probe via login, fetch /discovery, send_command via POST /cmd.\n\n```json:metadata\n{\"files\": [\"custom_components/elmax_local/transport/http.py\", \"tests/transport/test_http.py\"], \"verifyCommand\": \"pytest tests/transport/test_http.py -v\", \"acceptanceCriteria\": [\"probe OK on 200\", \"probe False on 401\", \"fetch_state returns dict\", \"send_command 200=ok\", \"422 retries\", \"503 fails\"]}\n```"},
@@ -58,5 +58,5 @@
     {"id": 27, "subject": "Task 27: Tag v1.0.0 + branch v1-maintenance + merge v2 to master", "status": "pending", "blockedBy": [26],
      "description": "Git release ops. Rename repo on GitHub.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git tag -l && git branch -a\", \"acceptanceCriteria\": [\"v1.0.0 tag exists\", \"v2.0.0 tag exists\", \"v1-maintenance branch exists\", \"master = v2\"]}\n```"}
   ],
-  "lastUpdated": "2026-05-15T13:00:00Z"
+  "lastUpdated": "2026-05-15T14:00:00Z"
 }
