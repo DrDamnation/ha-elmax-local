@@ -11,6 +11,7 @@ from custom_components.elmax_local.binary_sensor import (
     ElmaxZoneSensor, _infer_device_class,
 )
 from custom_components.elmax_local.coordinator import ElmaxLocalCoordinator
+from custom_components.elmax_local.button import ElmaxScenarioButton
 from custom_components.elmax_local.switch import ElmaxOutputSwitch
 
 
@@ -74,3 +75,9 @@ async def test_switch_turn_off(coord_with_data):
     sw = ElmaxOutputSwitch(coord_with_data, "abc123-uscita-0")
     await sw.async_turn_off()
     coord_with_data.async_send_command.assert_called_with("abc123-uscita-0", "2")
+
+
+async def test_button_press(coord_with_data):
+    btn = ElmaxScenarioButton(coord_with_data, "abc123-scenario-0")
+    await btn.async_press()
+    coord_with_data.async_send_command.assert_called_with("abc123-scenario-0", None)
