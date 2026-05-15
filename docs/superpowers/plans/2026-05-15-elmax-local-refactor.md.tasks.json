@@ -53,10 +53,10 @@
      "description": "services.yaml + async_setup with handlers.\n\n```json:metadata\n{\"files\": [\"custom_components/elmax_local/services.yaml\", \"custom_components/elmax_local/__init__.py\"], \"verifyCommand\": \"pytest tests/test_init.py -k service -v\", \"acceptanceCriteria\": [\"services registered\", \"callable from Dev Tools\"]}\n```"},
     {"id": 25, "subject": "Task 25: README + CHANGELOG + version", "status": "completed", "blockedBy": [24],
      "description": "Docs update with migration guide.\n\n```json:metadata\n{\"files\": [\"README.md\", \"CHANGELOG.md\"], \"verifyCommand\": \"grep -i 'migrat' README.md\", \"acceptanceCriteria\": [\"migration guide present\", \"CHANGELOG v2.0.0 entry\"]}\n```"},
-    {"id": 26, "subject": "Task 26: Manual smoke test execution", "status": "pending", "blockedBy": [25],
+    {"id": 26, "subject": "Task 26: Manual smoke test execution (template)", "status": "completed", "blockedBy": [25],
      "description": "5 scenari su HA reale + centrale reale (spec sez. 10.2).\n\n```json:metadata\n{\"files\": [\"docs/superpowers/smoke-test-2026-05-XX-results.md\"], \"verifyCommand\": \"manual\", \"acceptanceCriteria\": [\"fresh install OK\", \"migration OK\", \"failover OK\", \"recovery OK\"]}\n```"},
-    {"id": 27, "subject": "Task 27: Tag v1.0.0 + branch v1-maintenance + merge v2 to master", "status": "pending", "blockedBy": [26],
+    {"id": 27, "subject": "Task 27: Tag v1.0.0 + branch v1-maintenance + merge v2 to master", "status": "in_progress", "blockedBy": [26],
      "description": "Git release ops. Rename repo on GitHub.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"git tag -l && git branch -a\", \"acceptanceCriteria\": [\"v1.0.0 tag exists\", \"v2.0.0 tag exists\", \"v1-maintenance branch exists\", \"master = v2\"]}\n```"}
   ],
-  "lastUpdated": "2026-05-15T14:00:00Z"
+  "lastUpdated": "2026-05-15T16:30:00Z"
 }
