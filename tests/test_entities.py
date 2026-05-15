@@ -11,6 +11,7 @@ from custom_components.elmax_local.binary_sensor import (
     ElmaxZoneSensor, _infer_device_class,
 )
 from custom_components.elmax_local.coordinator import ElmaxLocalCoordinator
+from custom_components.elmax_local.switch import ElmaxOutputSwitch
 
 
 @pytest.fixture
@@ -61,3 +62,15 @@ def test_infer_device_class_default():
 def test_zone_is_on(coord_with_data):
     zone = ElmaxZoneSensor(coord_with_data, "abc123-zona-0")
     assert zone.is_on is False  # aperta=False in mock_panel_data
+
+
+async def test_switch_turn_on(coord_with_data):
+    sw = ElmaxOutputSwitch(coord_with_data, "abc123-uscita-0")
+    await sw.async_turn_on()
+    coord_with_data.async_send_command.assert_called_with("abc123-uscita-0", "1")
+
+
+async def test_switch_turn_off(coord_with_data):
+    sw = ElmaxOutputSwitch(coord_with_data, "abc123-uscita-0")
+    await sw.async_turn_off()
+    coord_with_data.async_send_command.assert_called_with("abc123-uscita-0", "2")
