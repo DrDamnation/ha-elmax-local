@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.elmax_local import async_setup_entry
+from custom_components.elmax_local import async_setup, async_setup_entry
 from custom_components.elmax_local.const import (
     CONF_PANEL_HOST, CONF_PANEL_ID, CONF_PANEL_PIN, DOMAIN,
+    SERVICE_MIGRATE, SERVICE_ROLLBACK,
 )
 
 
@@ -35,3 +36,9 @@ async def test_setup_entry_success(hass, entry):
             result = await async_setup_entry(hass, entry)
         assert result is True
         assert hass.data[DOMAIN]["test_entry"] is instance
+
+
+async def test_services_registered(hass):
+    await async_setup(hass, {})
+    assert hass.services.has_service(DOMAIN, SERVICE_MIGRATE)
+    assert hass.services.has_service(DOMAIN, SERVICE_ROLLBACK)

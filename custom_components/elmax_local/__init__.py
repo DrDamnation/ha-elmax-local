@@ -4,18 +4,34 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .auth import ElmaxAuthError
 from .const import (
     CONF_ENABLE_MQTT, CONF_ENABLE_WS, CONF_PANEL_HOST, CONF_PANEL_ID,
     CONF_PANEL_PIN, CONF_RECONCILE_INTERVAL, DEFAULT_RECONCILE_INTERVAL,
-    DOMAIN, PLATFORMS,
+    DOMAIN, PLATFORMS, SERVICE_MIGRATE, SERVICE_ROLLBACK,
 )
 from .coordinator import ElmaxLocalCoordinator
+from .migration import async_migrate, async_rollback
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register services on integration load (called once)."""
+
+    async def _handle_migrate(call: ServiceCall) -> None:
+        await async_migrate(hass)
+
+    async def _handle_rollback(call: ServiceCall) -> None:
+        await async_rollback(hass)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_MIGRATE):
+        hass.services.async_register(DOMAIN, SERVICE_MIGRATE, _handle_migrate)
+        hass.services.async_register(DOMAIN, SERVICE_ROLLBACK, _handle_rollback)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
