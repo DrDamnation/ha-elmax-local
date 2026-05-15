@@ -70,13 +70,48 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         await self.registry.async_stop_all()
         await self.auth.async_close()
 
-    async def _async_update_data(self) -> ElmaxState:
-        """Stub — Task 9 implements."""
-        raise UpdateFailed("Implemented in Task 9")
+    def _parse(self, raw: dict, source: str = "poll") -> ElmaxState:
+        """Normalize /api/v2/discovery payload to ElmaxState.
+        Indexes lists by endpointId for O(1) lookup by entities."""
+        return ElmaxState(
+            panel_info={
+                "centrale": raw.get("centrale", self.panel_id),
+                "release": raw.get("release", ""),
+                "tipo_accessorio": raw.get("tipo_accessorio", ""),
+                "release_accessorio": raw.get("release_accessorio", ""),
+                "tappFeature": raw.get("tappFeature", False),
+                "sceneFeature": raw.get("sceneFeature", False),
+            },
+            zones={z["endpointId"]: z for z in raw.get("zone", [])
+                   if "endpointId" in z},
+            areas={a["endpointId"]: a for a in raw.get("aree", [])
+                   if "endpointId" in a},
+            outputs={o["endpointId"]: o for o in raw.get("uscite", [])
+                     if "endpointId" in o},
+            scenarios={s["endpointId"]: s for s in raw.get("scenari", [])
+                       if "endpointId" in s},
+            last_update_source=source,
+            last_update_ts=time.time(),
+        )
 
     async def _on_push_state_update(self, raw: dict) -> None:
-        """Stub — Task 9 implements."""
-        return None
+        """Called by PUSH transports on each spontaneous state update."""
+        push = self.registry.get_active_push_transports()
+        source = push[0].name if push else "push"
+        new_state = self._parse(raw, source=source)
+        self.async_set_updated_data(new_state)
+
+    async def _async_update_data(self) -> ElmaxState:
+        """Reconciliation poll. Skipped if push is fresh."""
+        if self._push_is_fresh():
+            return self.data
+        raw = await self.registry.async_fetch_state()
+        if raw is None:
+            if self.data is not None:
+                _LOGGER.debug("Poll failed; keeping last known state")
+                return self.data
+            raise UpdateFailed("All polling transports failed; no prior state")
+        return self._parse(raw, source="poll")
 
     def _push_is_fresh(self) -> bool:
         if not self.data or self.data.last_update_ts == 0:
