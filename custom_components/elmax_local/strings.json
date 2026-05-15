@@ -2,9 +2,9 @@
   "config": {
     "step": {
       "user": {
+        "description": "L'ID centrale viene rilevato automaticamente dopo il login.",
         "data": {
           "panel_host": "Indirizzo IP centrale",
-          "panel_id": "ID centrale",
           "panel_pin": "PIN"
         }
       }
@@ -12,7 +12,6 @@
     "error": {
       "cannot_connect": "Impossibile raggiungere la centrale",
       "invalid_auth": "PIN non valido",
-      "panel_id_mismatch": "L'ID inserito non corrisponde alla centrale rispondente",
       "unknown": "Errore inatteso"
     },
     "abort": {

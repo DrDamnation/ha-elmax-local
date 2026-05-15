@@ -34,14 +34,14 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
+        default_host = self.context.get("host", "")
 
         if user_input is not None:
-            panel_id = user_input[CONF_PANEL_ID].strip()
             pin = user_input[CONF_PANEL_PIN].strip()
             host = user_input[CONF_PANEL_HOST].strip()
 
-            err = await self._validate(host, panel_id, pin)
-            if err is None:
+            panel_id, err = await self._validate(host, pin)
+            if err is None and panel_id:
                 await self.async_set_unique_id(panel_id)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
@@ -49,33 +49,25 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={CONF_PANEL_ID: panel_id, CONF_PANEL_PIN: pin,
                           CONF_PANEL_HOST: host},
                 )
-            errors["base"] = err
+            errors["base"] = err or "unknown"
 
-        panels = await self._discover_panels()
-        if panels:
-            schema = vol.Schema({
-                vol.Required(CONF_PANEL_ID): vol.In({p: p for p in panels}),
-                vol.Required(CONF_PANEL_PIN): str,
-                vol.Required(CONF_PANEL_HOST): str,
-            })
-        else:
-            schema = vol.Schema({
-                vol.Required(CONF_PANEL_ID): str,
-                vol.Required(CONF_PANEL_PIN): str,
-                vol.Required(CONF_PANEL_HOST): str,
-            })
+        # If MQTT discovery finds the panel, pre-fill the host (best-effort).
+        if not default_host:
+            discovered = await self._discover_panels()
+            if discovered:
+                default_host = discovered[0].get("host", default_host)
+
+        schema = vol.Schema({
+            vol.Required(CONF_PANEL_HOST, default=default_host): str,
+            vol.Required(CONF_PANEL_PIN): str,
+        })
 
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
     async def async_step_zeroconf(self, discovery_info: ZeroconfServiceInfo) -> FlowResult:
         host = str(discovery_info.ip_address)
         self.context["host"] = host
-        schema = vol.Schema({
-            vol.Required(CONF_PANEL_HOST, default=host): str,
-            vol.Required(CONF_PANEL_ID): str,
-            vol.Required(CONF_PANEL_PIN): str,
-        })
-        return self.async_show_form(step_id="user", data_schema=schema)
+        return await self.async_step_user()
 
     async def async_step_import(self, import_data: dict[str, Any]) -> FlowResult:
         """Invocato dal migration service. Bypassa validazione interattiva."""
@@ -86,13 +78,16 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data=import_data,
         )
 
-    async def _discover_panels(self) -> list[str]:
+    async def _discover_panels(self) -> list[dict]:
+        """Probe panels via MQTT. Returns list of dicts with at least
+        'centrale' (panel_id). Host is not exposed via this topic, so
+        callers must still ask the user for the IP."""
         try:
             if not mqtt.async_wait_for_mqtt_client(self.hass):
                 return []
         except Exception:
             return []
-        panels: list[str] = []
+        panels: list[dict] = []
         event = asyncio.Event()
 
         @callback
@@ -100,7 +95,7 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 data = json.loads(msg.payload)
                 if "centrale" in data:
-                    panels.append(data["centrale"])
+                    panels.append(data)
                     event.set()
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -117,7 +112,9 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.debug("MQTT discovery failed: %s", err)
         return panels
 
-    async def _validate(self, host: str, panel_id: str, pin: str) -> str | None:
+    async def _validate(self, host: str, pin: str) -> tuple[str | None, str | None]:
+        """Login to the panel and read its panel_id from /discovery.
+        Returns (panel_id, error_key). On success, error_key is None."""
         auth = AuthManager(self.hass, host, pin)
         try:
             token = await auth.async_get_token()
@@ -128,18 +125,19 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
-                    return "cannot_connect"
+                    return None, "cannot_connect"
                 data = await resp.json()
-                if data.get("centrale") and data["centrale"] != panel_id:
-                    return "panel_id_mismatch"
-            return None
+                panel_id = data.get("centrale")
+                if not panel_id:
+                    return None, "cannot_connect"
+                return panel_id, None
         except ElmaxAuthError as err:
             if "401" in str(err) or "403" in str(err):
-                return "invalid_auth"
-            return "cannot_connect"
+                return None, "invalid_auth"
+            return None, "cannot_connect"
         except Exception as err:
             _LOGGER.exception("Validate error: %s", err)
-            return "unknown"
+            return None, "unknown"
         finally:
             await auth.async_close()
 
