@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "panel_host": "Indirizzo IP centrale",
+          "panel_id": "ID centrale",
+          "panel_pin": "PIN"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Impossibile raggiungere la centrale",
+      "invalid_auth": "PIN non valido",
+      "panel_id_mismatch": "L'ID inserito non corrisponde alla centrale rispondente",
+      "unknown": "Errore inatteso"
+    },
+    "abort": {
+      "already_configured": "Questa centrale è già configurata"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "enable_ws": "WebSocket push (real-time, fw VideoBox ≥ 4.11)",
+          "enable_mqtt": "MQTT push + polling (richiede broker MQTT in HA)",
+          "reconcile_interval": "Intervallo riconciliazione (secondi)"
+        }
+      }
+    }
+  }
+}
