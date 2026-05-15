@@ -1,9 +1,37 @@
 """Common fixtures for elmax_local tests."""
 from __future__ import annotations
 
+import asyncio
+
+import aiohttp
 import pytest
 
 pytest_plugins = ["pytest_homeassistant_custom_component"]
+
+
+def _prewarm_pycares_thread() -> None:
+    # pycares spawns a daemon _run_safe_shutdown_loop thread on first
+    # DNS-channel destroy. HA's verify_cleanup fixture fails any test that
+    # introduces a new thread; pre-spawning here puts the thread into
+    # threads_before for every test.
+    async def _go() -> None:
+        async with aiohttp.ClientSession() as session:
+            try:
+                await session.get(
+                    "http://127.0.0.1:1/",
+                    timeout=aiohttp.ClientTimeout(total=0.01),
+                )
+            except Exception:
+                pass
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_go())
+    finally:
+        loop.close()
+
+
+_prewarm_pycares_thread()
 
 
 @pytest.fixture(autouse=True)
