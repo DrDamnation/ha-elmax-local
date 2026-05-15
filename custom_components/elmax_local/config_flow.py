@@ -16,8 +16,10 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .auth import AuthManager, ElmaxAuthError
 from .const import (
-    CONF_PANEL_HOST, CONF_PANEL_ID, CONF_PANEL_PIN,
-    DOMAIN, TOPIC_REQUEST_ID, TOPIC_RESPONSE_ID,
+    CONF_ENABLE_MQTT, CONF_ENABLE_WS, CONF_PANEL_HOST, CONF_PANEL_ID,
+    CONF_PANEL_PIN, CONF_RECONCILE_INTERVAL, DEFAULT_RECONCILE_INTERVAL,
+    DOMAIN, MAX_RECONCILE_INTERVAL, MIN_RECONCILE_INTERVAL,
+    TOPIC_REQUEST_ID, TOPIC_RESPONSE_ID,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -145,10 +147,27 @@ class ElmaxLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ElmaxLocalOptionsFlow(config_entries.OptionsFlow):
-    """Implementata in Task 18."""
-
     def __init__(self, config_entry):
         self.config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
-        raise NotImplementedError("Task 18")
+        if user_input is not None:
+            user_input[CONF_RECONCILE_INTERVAL] = max(
+                MIN_RECONCILE_INTERVAL,
+                min(MAX_RECONCILE_INTERVAL, user_input[CONF_RECONCILE_INTERVAL])
+            )
+            return self.async_create_entry(title="", data=user_input)
+
+        opts = self.config_entry.options
+        schema = vol.Schema({
+            vol.Required(CONF_ENABLE_WS,
+                         default=opts.get(CONF_ENABLE_WS, True)): bool,
+            vol.Required(CONF_ENABLE_MQTT,
+                         default=opts.get(CONF_ENABLE_MQTT, True)): bool,
+            vol.Required(CONF_RECONCILE_INTERVAL,
+                         default=opts.get(CONF_RECONCILE_INTERVAL,
+                                          DEFAULT_RECONCILE_INTERVAL)):
+                vol.All(int, vol.Range(min=MIN_RECONCILE_INTERVAL,
+                                       max=MAX_RECONCILE_INTERVAL)),
+        })
+        return self.async_show_form(step_id="init", data_schema=schema)

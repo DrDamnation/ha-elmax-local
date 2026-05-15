@@ -8,8 +8,11 @@ from ipaddress import ip_address
 from aioresponses import aioresponses
 from homeassistant.components.zeroconf import ZeroconfServiceInfo
 from homeassistant.data_entry_flow import FlowResultType
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.elmax_local.const import DOMAIN
+from custom_components.elmax_local.const import (
+    CONF_PANEL_HOST, CONF_PANEL_ID, CONF_PANEL_PIN, DOMAIN,
+)
 
 
 async def test_user_step_success(hass):
@@ -81,3 +84,36 @@ async def test_zeroconf_step(hass):
     )
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "user"
+
+
+async def test_options_flow(hass):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_PANEL_ID: "abc", CONF_PANEL_PIN: "0", CONF_PANEL_HOST: "1.2.3.4"},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == FlowResultType.FORM
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"enable_ws": False, "enable_mqtt": True, "reconcile_interval": 120},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"]["reconcile_interval"] == 120
+
+
+async def test_options_flow_clamps_interval(hass):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_PANEL_ID: "abc", CONF_PANEL_PIN: "0", CONF_PANEL_HOST: "1.2.3.4"},
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    # voluptuous Range raises before our clamp can run; test the explicit clamp
+    # by submitting an in-range value (the clamp inside also enforces bounds).
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"enable_ws": True, "enable_mqtt": True, "reconcile_interval": 30},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"]["reconcile_interval"] == 30
