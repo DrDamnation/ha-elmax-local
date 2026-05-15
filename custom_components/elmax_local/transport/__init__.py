@@ -5,6 +5,7 @@ Concrete implementations in transport/http.py, mqtt.py, websocket.py.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -87,26 +88,80 @@ class Transport(ABC):
         raise NotImplementedError(f"{self.name} does not support COMMAND")
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 class TransportRegistry:
-    """Orchestrates N transports. Routing logic implemented in Task 7."""
+    """Orchestrates N transports. Routes operations by capability + state."""
+
+    # Priority order for POLL and COMMAND fallback
+    _POLL_PRIORITY = ("http", "mqtt")
+    _COMMAND_PRIORITY = ("http", "mqtt")
 
     def __init__(self, transports: list[Transport]):
         self._transports = transports
 
-    async def async_start_all(self, auth, on_state_update) -> None:
-        raise NotImplementedError("Implemented in Task 7")
+    async def async_start_all(
+        self,
+        auth: "AuthManager",
+        on_state_update: StateUpdateCallback,
+    ) -> None:
+        for t in self._transports:
+            try:
+                ok = await t.async_probe()
+                if ok:
+                    await t.async_start(auth, on_state_update)
+                else:
+                    _LOGGER.info("Transport %s probe failed, marking UNSUPPORTED",
+                                 t.name)
+            except Exception as err:
+                _LOGGER.warning("Transport %s failed to start: %s", t.name, err)
 
     async def async_stop_all(self) -> None:
-        raise NotImplementedError("Implemented in Task 7")
+        for t in self._transports:
+            try:
+                await t.async_stop()
+            except Exception:
+                pass
+
+    def _by_name(self, name: str) -> Transport | None:
+        for t in self._transports:
+            if t.name == name:
+                return t
+        return None
 
     async def async_fetch_state(self) -> dict | None:
-        raise NotImplementedError("Implemented in Task 7")
+        for name in self._POLL_PRIORITY:
+            t = self._by_name(name)
+            if (t and TransportCapability.POLL in t.capabilities
+                    and t.state == TransportState.READY):
+                result = await t.async_fetch_state()
+                if result is not None:
+                    return result
+        return None
 
-    async def async_send_command(self, eid, cmd, code=None) -> CommandResult:
-        raise NotImplementedError("Implemented in Task 7")
+    async def async_send_command(
+        self,
+        endpoint_id: str,
+        cmd: str | None,
+        code: str | None = None,
+    ) -> CommandResult:
+        last_error = "no_transport"
+        for name in self._COMMAND_PRIORITY:
+            t = self._by_name(name)
+            if (t and TransportCapability.COMMAND in t.capabilities
+                    and t.state == TransportState.READY):
+                result = await t.async_send_command(endpoint_id, cmd, code)
+                if result.ok:
+                    return result
+                last_error = result.error or "unknown"
+        return CommandResult(ok=False, error=last_error)
 
     def get_active_push_transports(self) -> list[Transport]:
-        raise NotImplementedError("Implemented in Task 7")
+        return [t for t in self._transports
+                if TransportCapability.PUSH in t.capabilities
+                and t.state == TransportState.READY]
 
     def degraded_or_unsupported(self) -> list[Transport]:
-        raise NotImplementedError("Implemented in Task 7")
+        return [t for t in self._transports
+                if t.state in (TransportState.DEGRADED, TransportState.UNSUPPORTED)]
