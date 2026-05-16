@@ -79,7 +79,13 @@ class WebSocketTransport(Transport):
         self._auth = auth
         self._on_push = on_state_update
         self._stop_event.clear()
-        self._task = self._hass.async_create_task(self._run_loop())
+        # Background task — must NOT block HA bootstrap. The reconnect loop
+        # runs forever (while not stop_event), so a regular async_create_task
+        # would keep HA waiting in setup phase and trip the bootstrap timeout
+        # at ~10 minutes ("Setup timed out for bootstrap waiting on ...").
+        self._task = self._hass.async_create_background_task(
+            self._run_loop(), name=f"elmax_local_ws_{self._host}"
+        )
         self._state = TransportState.READY
 
     async def async_stop(self) -> None:
