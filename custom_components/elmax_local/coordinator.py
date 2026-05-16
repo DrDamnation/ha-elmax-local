@@ -110,7 +110,23 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         raw = await self.registry.async_fetch_state()
         if raw is None:
             if self.data is not None:
-                _LOGGER.debug("Poll failed; keeping last known state")
+                # Watchdog: warn if we have been stale beyond a couple of
+                # intervals — operators want a visible signal in the log,
+                # not silent staleness.
+                interval = (self.update_interval.total_seconds()
+                            if self.update_interval else 90)
+                stale_for = time.time() - self.data.last_update_ts
+                if stale_for > 2 * interval:
+                    _LOGGER.warning(
+                        "Coordinator stale: no fresh data for %ds "
+                        "(transports: %s). Last source: %s",
+                        int(stale_for),
+                        ", ".join(f"{t.name}={t.state.value}"
+                                  for t in self.registry._transports),
+                        self.data.last_update_source,
+                    )
+                else:
+                    _LOGGER.debug("Poll failed; keeping last known state")
                 return self.data
             raise UpdateFailed("All polling transports failed; no prior state")
         return self._parse(raw, source="poll")
