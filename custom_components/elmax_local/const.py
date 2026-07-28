@@ -15,9 +15,21 @@ CONF_ENABLE_WS: Final = "enable_ws"
 CONF_ENABLE_MQTT: Final = "enable_mqtt"
 CONF_RECONCILE_INTERVAL: Final = "reconcile_interval"
 
+# ContactVideo C315 bridge transport
+CONF_CV_HOST: Final = "cv_host"
+CONF_ENABLE_PANEL: Final = "enable_panel"
+
 DEFAULT_RECONCILE_INTERVAL: Final = 90
 MIN_RECONCILE_INTERVAL: Final = 30
 MAX_RECONCILE_INTERVAL: Final = 600
+
+# Staleness thresholds, in multiples of the reconcile interval.
+# WARN: visible signal in the log while still serving the last known state.
+# UNAVAILABLE: past this the state is too old to be trusted, so the
+# coordinator fails the update and entities go unavailable rather than
+# silently showing a frozen alarm state.
+STALE_WARN_RATIO: Final = 2
+STALE_UNAVAILABLE_RATIO: Final = 5
 
 TOPIC_REQUEST_ID: Final = "/elmax/request/id"
 TOPIC_RESPONSE_ID: Final = "/elmax/response/id"
@@ -32,6 +44,8 @@ TOPIC_RESPONSE_COMMAND: Final = "/elmax/response/command/{panel_id}"
 
 HTTP_BASE_URL: Final = "https://{host}/api/v2"
 WS_BASE_URL: Final = "wss://{host}/api/v2/push"
+# ContactVideo C315 bridge — plain HTTP on port 8083
+PANEL_BASE_URL: Final = "http://{host}:8083/api"
 
 CMD_AREA_DISARM: Final = "0"
 CMD_AREA_ARM_P1: Final = "1"

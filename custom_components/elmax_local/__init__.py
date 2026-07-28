@@ -9,9 +9,10 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .auth import ElmaxAuthError
 from .const import (
-    CONF_ENABLE_MQTT, CONF_ENABLE_WS, CONF_PANEL_HOST, CONF_PANEL_ID,
-    CONF_PANEL_PIN, CONF_RECONCILE_INTERVAL, DEFAULT_RECONCILE_INTERVAL,
-    DOMAIN, PLATFORMS, SERVICE_MIGRATE, SERVICE_ROLLBACK,
+    CONF_CV_HOST, CONF_ENABLE_MQTT, CONF_ENABLE_PANEL, CONF_ENABLE_WS,
+    CONF_PANEL_HOST, CONF_PANEL_ID, CONF_PANEL_PIN, CONF_RECONCILE_INTERVAL,
+    DEFAULT_RECONCILE_INTERVAL, DOMAIN, PLATFORMS, SERVICE_MIGRATE,
+    SERVICE_ROLLBACK,
 )
 from .coordinator import ElmaxLocalCoordinator
 from .migration import async_migrate, async_rollback
@@ -46,6 +47,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_RECONCILE_INTERVAL, DEFAULT_RECONCILE_INTERVAL),
         enable_ws=entry.options.get(CONF_ENABLE_WS, True),
         enable_mqtt=entry.options.get(CONF_ENABLE_MQTT, True),
+        enable_panel=entry.options.get(CONF_ENABLE_PANEL, False),
+        cv_host=entry.options.get(CONF_CV_HOST, ""),
     )
 
     try:

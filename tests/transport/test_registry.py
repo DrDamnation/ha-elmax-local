@@ -113,3 +113,65 @@ def test_get_active_push_transports():
     active = reg.get_active_push_transports()
     assert mqtt in active
     assert ws not in active
+
+
+# --- Recovery from DEGRADED (regression: degraded was terminal) ---
+
+async def test_fetch_retries_degraded_transport(hass, mock_panel_data):
+    """A DEGRADED transport must still be called: that call is what heals it."""
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}),
+                          fetch_result=mock_panel_data)
+    http._state = TransportState.DEGRADED
+    reg = TransportRegistry([http])
+
+    assert await reg.async_fetch_state() == mock_panel_data
+
+
+async def test_fetch_prefers_ready_over_degraded(hass, mock_panel_data):
+    """Healthy transports are attempted first, degraded ones only as fallback."""
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}),
+                          fetch_result={"stale": True})
+    http._state = TransportState.DEGRADED
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.POLL}),
+                          fetch_result=mock_panel_data)
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    # http has higher raw priority but is degraded, so mqtt answers.
+    assert await reg.async_fetch_state() == mock_panel_data
+
+
+async def test_fetch_skips_disabled_and_unsupported(hass):
+    """Disabled/unsupported transports stay out of rotation."""
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}),
+                          fetch_result={"never": True})
+    http._state = TransportState.DISABLED
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.POLL}),
+                          fetch_result={"never": True})
+    mqtt._state = TransportState.UNSUPPORTED
+    reg = TransportRegistry([http, mqtt])
+
+    assert await reg.async_fetch_state() is None
+
+
+async def test_command_retries_degraded_transport():
+    """Same recovery path for commands, otherwise the panel stays uncontrollable."""
+    http = _FakeTransport("http", frozenset({TransportCapability.COMMAND}),
+                          command_result=CommandResult(ok=True))
+    http._state = TransportState.DEGRADED
+    reg = TransportRegistry([http])
+
+    assert (await reg.async_send_command("abc-area-0", "1")).ok
+
+
+async def test_fetch_survives_transport_exception(hass, mock_panel_data):
+    """One transport raising must not abort the whole fallback chain."""
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}))
+    http._state = TransportState.READY
+    http.async_fetch_state = AsyncMock(side_effect=OSError("boom"))
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.POLL}),
+                          fetch_result=mock_panel_data)
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    assert await reg.async_fetch_state() == mock_panel_data

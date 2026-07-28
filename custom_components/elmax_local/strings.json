@@ -24,7 +24,9 @@
         "data": {
           "enable_ws": "WebSocket push (real-time, fw VideoBox ≥ 4.11)",
           "enable_mqtt": "MQTT push + polling (richiede broker MQTT in HA)",
-          "reconcile_interval": "Intervallo riconciliazione (secondi)"
+          "reconcile_interval": "Intervallo riconciliazione (secondi)",
+          "enable_panel": "Ponte C315 (fallback cablato via ContactVideo)",
+          "cv_host": "Indirizzo IP/hostname ponte C315 (lascia vuoto per disabilitare)"
         }
       }
     }

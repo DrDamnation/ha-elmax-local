@@ -95,9 +95,11 @@ _LOGGER = logging.getLogger(__name__)
 class TransportRegistry:
     """Orchestrates N transports. Routes operations by capability + state."""
 
-    # Priority order for POLL and COMMAND fallback
-    _POLL_PRIORITY = ("http", "mqtt")
-    _COMMAND_PRIORITY = ("http", "mqtt")
+    # Priority order for POLL and COMMAND fallback.
+    # "panel" (C315 bridge) is intentionally LAST: it is the wired fallback
+    # that succeeds when the official API / MQTT are unavailable.
+    _POLL_PRIORITY = ("http", "mqtt", "websocket", "panel")
+    _COMMAND_PRIORITY = ("http", "mqtt", "panel")
 
     def __init__(self, transports: list[Transport]):
         self._transports = transports
@@ -162,14 +164,36 @@ class TransportRegistry:
                 return t
         return None
 
-    async def async_fetch_state(self) -> dict | None:
-        for name in self._POLL_PRIORITY:
+    def _candidates(
+        self,
+        priority: tuple[str, ...],
+        capability: TransportCapability,
+    ) -> list[Transport]:
+        """Transports to attempt, healthy ones first.
+
+        DEGRADED transports are retried after the READY ones: a degraded
+        transport only recovers by being called again (a successful call
+        flips it back to READY), so skipping it makes the failure permanent.
+        Ordering keeps the happy path free of a degraded transport's timeout.
+        """
+        by_state: dict[TransportState, list[Transport]] = {
+            TransportState.READY: [], TransportState.DEGRADED: [],
+        }
+        for name in priority:
             t = self._by_name(name)
-            if (t and TransportCapability.POLL in t.capabilities
-                    and t.state == TransportState.READY):
+            if t and capability in t.capabilities and t.state in by_state:
+                by_state[t.state].append(t)
+        return by_state[TransportState.READY] + by_state[TransportState.DEGRADED]
+
+    async def async_fetch_state(self) -> dict | None:
+        for t in self._candidates(self._POLL_PRIORITY, TransportCapability.POLL):
+            try:
                 result = await t.async_fetch_state()
-                if result is not None:
-                    return result
+            except Exception as err:
+                _LOGGER.debug("Transport %s fetch raised: %s", t.name, err)
+                continue
+            if result is not None:
+                return result
         return None
 
     async def async_send_command(
@@ -179,14 +203,17 @@ class TransportRegistry:
         code: str | None = None,
     ) -> CommandResult:
         last_error = "no_transport"
-        for name in self._COMMAND_PRIORITY:
-            t = self._by_name(name)
-            if (t and TransportCapability.COMMAND in t.capabilities
-                    and t.state == TransportState.READY):
+        for t in self._candidates(self._COMMAND_PRIORITY,
+                                  TransportCapability.COMMAND):
+            try:
                 result = await t.async_send_command(endpoint_id, cmd, code)
-                if result.ok:
-                    return result
-                last_error = result.error or "unknown"
+            except Exception as err:
+                _LOGGER.debug("Transport %s command raised: %s", t.name, err)
+                last_error = str(err) or "exception"
+                continue
+            if result.ok:
+                return result
+            last_error = result.error or "unknown"
         return CommandResult(ok=False, error=last_error)
 
     def get_active_push_transports(self) -> list[Transport]:

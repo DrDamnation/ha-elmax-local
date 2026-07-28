@@ -11,10 +11,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth import AuthManager
-from .const import DEFAULT_RECONCILE_INTERVAL
+from .const import (
+    DEFAULT_RECONCILE_INTERVAL,
+    STALE_UNAVAILABLE_RATIO,
+    STALE_WARN_RATIO,
+)
 from .transport import TransportRegistry
 from .transport.http import HttpTransport
 from .transport.mqtt import MqttTransport
+from .transport.panel import PanelTransport
 from .transport.websocket import WebSocketTransport
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +51,8 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         reconcile_interval: int = DEFAULT_RECONCILE_INTERVAL,
         enable_ws: bool = True,
         enable_mqtt: bool = True,
+        enable_panel: bool = False,
+        cv_host: str = "",
     ):
         super().__init__(
             hass, _LOGGER,
@@ -61,6 +68,10 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
             transports.append(MqttTransport(hass, panel_id))
         if enable_ws:
             transports.append(WebSocketTransport(hass, host))
+        # PanelTransport is appended LAST: it is the wired fallback that
+        # succeeds when the official API transports are unavailable.
+        if enable_panel and cv_host:
+            transports.append(PanelTransport(hass, panel_id, cv_host, pin))
         self.registry = TransportRegistry(transports)
 
     async def async_setup(self) -> None:
@@ -110,19 +121,24 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         raw = await self.registry.async_fetch_state()
         if raw is None:
             if self.data is not None:
-                # Watchdog: warn if we have been stale beyond a couple of
-                # intervals — operators want a visible signal in the log,
-                # not silent staleness.
                 interval = (self.update_interval.total_seconds()
-                            if self.update_interval else 90)
+                            if self.update_interval else DEFAULT_RECONCILE_INTERVAL)
                 stale_for = time.time() - self.data.last_update_ts
-                if stale_for > 2 * interval:
+                transports = ", ".join(f"{t.name}={t.state.value}"
+                                       for t in self.registry._transports)
+                if stale_for > STALE_UNAVAILABLE_RATIO * interval:
+                    # Past this point the cached state is not trustworthy:
+                    # surface it as unavailable instead of serving an alarm
+                    # state that may be minutes or hours out of date.
+                    raise UpdateFailed(
+                        f"No fresh data for {int(stale_for)}s "
+                        f"(transports: {transports})"
+                    )
+                if stale_for > STALE_WARN_RATIO * interval:
                     _LOGGER.warning(
                         "Coordinator stale: no fresh data for %ds "
                         "(transports: %s). Last source: %s",
-                        int(stale_for),
-                        ", ".join(f"{t.name}={t.state.value}"
-                                  for t in self.registry._transports),
+                        int(stale_for), transports,
                         self.data.last_update_source,
                     )
                 else:

@@ -19,10 +19,10 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .auth import AuthManager, ElmaxAuthError
 from .const import (
-    CONF_ENABLE_MQTT, CONF_ENABLE_WS, CONF_PANEL_HOST, CONF_PANEL_ID,
-    CONF_PANEL_PIN, CONF_RECONCILE_INTERVAL, DEFAULT_RECONCILE_INTERVAL,
-    DOMAIN, MAX_RECONCILE_INTERVAL, MIN_RECONCILE_INTERVAL,
-    TOPIC_REQUEST_ID, TOPIC_RESPONSE_ID,
+    CONF_CV_HOST, CONF_ENABLE_MQTT, CONF_ENABLE_PANEL, CONF_ENABLE_WS,
+    CONF_PANEL_HOST, CONF_PANEL_ID, CONF_PANEL_PIN, CONF_RECONCILE_INTERVAL,
+    DEFAULT_RECONCILE_INTERVAL, DOMAIN, MAX_RECONCILE_INTERVAL,
+    MIN_RECONCILE_INTERVAL, TOPIC_REQUEST_ID, TOPIC_RESPONSE_ID,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -170,5 +170,10 @@ class ElmaxLocalOptionsFlow(config_entries.OptionsFlow):
                                           DEFAULT_RECONCILE_INTERVAL)):
                 vol.All(int, vol.Range(min=MIN_RECONCILE_INTERVAL,
                                        max=MAX_RECONCILE_INTERVAL)),
+            # ContactVideo C315 bridge transport (optional wired fallback)
+            vol.Optional(CONF_ENABLE_PANEL,
+                         default=opts.get(CONF_ENABLE_PANEL, False)): bool,
+            vol.Optional(CONF_CV_HOST,
+                         default=opts.get(CONF_CV_HOST, "")): str,
         })
         return self.async_show_form(step_id="init", data_schema=schema)
