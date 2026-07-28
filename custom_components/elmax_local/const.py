@@ -19,6 +19,14 @@ DEFAULT_RECONCILE_INTERVAL: Final = 90
 MIN_RECONCILE_INTERVAL: Final = 30
 MAX_RECONCILE_INTERVAL: Final = 600
 
+# Staleness thresholds, in multiples of the reconcile interval.
+# WARN: visible signal in the log while still serving the last known state.
+# UNAVAILABLE: past this the state is too old to be trusted, so the
+# coordinator fails the update and entities go unavailable rather than
+# silently showing a frozen alarm state.
+STALE_WARN_RATIO: Final = 2
+STALE_UNAVAILABLE_RATIO: Final = 5
+
 TOPIC_REQUEST_ID: Final = "/elmax/request/id"
 TOPIC_RESPONSE_ID: Final = "/elmax/response/id"
 TOPIC_REQUEST_LOGIN: Final = "/elmax/request/login/{panel_id}"

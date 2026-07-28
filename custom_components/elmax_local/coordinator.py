@@ -11,7 +11,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth import AuthManager
-from .const import DEFAULT_RECONCILE_INTERVAL
+from .const import (
+    DEFAULT_RECONCILE_INTERVAL,
+    STALE_UNAVAILABLE_RATIO,
+    STALE_WARN_RATIO,
+)
 from .transport import TransportRegistry
 from .transport.http import HttpTransport
 from .transport.mqtt import MqttTransport
@@ -114,15 +118,23 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
                 # intervals — operators want a visible signal in the log,
                 # not silent staleness.
                 interval = (self.update_interval.total_seconds()
-                            if self.update_interval else 90)
+                            if self.update_interval else DEFAULT_RECONCILE_INTERVAL)
                 stale_for = time.time() - self.data.last_update_ts
-                if stale_for > 2 * interval:
+                transports = ", ".join(f"{t.name}={t.state.value}"
+                                       for t in self.registry._transports)
+                if stale_for > STALE_UNAVAILABLE_RATIO * interval:
+                    # Past this point the cached state is not trustworthy:
+                    # surface it as unavailable instead of serving an alarm
+                    # state that may be minutes or hours out of date.
+                    raise UpdateFailed(
+                        f"No fresh data for {int(stale_for)}s "
+                        f"(transports: {transports})"
+                    )
+                if stale_for > STALE_WARN_RATIO * interval:
                     _LOGGER.warning(
                         "Coordinator stale: no fresh data for %ds "
                         "(transports: %s). Last source: %s",
-                        int(stale_for),
-                        ", ".join(f"{t.name}={t.state.value}"
-                                  for t in self.registry._transports),
+                        int(stale_for), transports,
                         self.data.last_update_source,
                     )
                 else:

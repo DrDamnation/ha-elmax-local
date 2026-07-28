@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
+
+import pytest
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.elmax_local.coordinator import (
     ElmaxLocalCoordinator, ElmaxState,
@@ -79,3 +83,28 @@ async def test_send_command_fail_no_verify(hass):
             assert ok is False
             await asyncio.sleep(0)
             mock_verify.assert_not_called()
+
+
+# --- Staleness escalation (regression: stale data was served forever) ---
+
+async def _stale_coord(hass, mock_panel_data, stale_seconds: float):
+    """Coordinator holding data that is `stale_seconds` old, poll failing."""
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4",
+                                  reconcile_interval=60)
+    await coord._on_push_state_update(mock_panel_data)
+    coord.data.last_update_ts = time.time() - stale_seconds
+    coord.registry.async_fetch_state = AsyncMock(return_value=None)
+    return coord
+
+
+async def test_serves_cached_state_while_briefly_stale(hass, mock_panel_data):
+    """A short outage keeps the last known state: no needless flapping."""
+    coord = await _stale_coord(hass, mock_panel_data, stale_seconds=90)
+    assert await coord._async_update_data() is coord.data
+
+
+async def test_raises_when_stale_beyond_threshold(hass, mock_panel_data):
+    """Past the threshold the state is too old to serve: entities go unavailable."""
+    coord = await _stale_coord(hass, mock_panel_data, stale_seconds=60 * 6)
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
