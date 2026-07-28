@@ -116,19 +116,27 @@ def _parse_jwt_exp(token: str) -> float:
         return time.time() + 3600.0
 
 
+# Internal kind -> the word the panel itself uses in its endpointIds.
+# The official /api/v2/discovery ids are deterministic — "{panel_id}-area-0",
+# "-zona-1", "-uscita-7", "-scenario-0" — and the bridge reports the same
+# indexes for the same physical items (uscita 7 is "Serranda" on both). So
+# this transport reproduces those ids instead of inventing its own: entities
+# keep one identity whichever transport answers, and a failover updates them
+# instead of replacing them.
+_KIND_WORD = {"area": "area", "zone": "zona", "out": "uscita", "scene": "scenario"}
+
+
 def _cv_endpoint_id(panel_id: str, kind: str, index: int) -> str:
-    """Synthesise a stable, index-recoverable endpointId."""
-    return f"{panel_id}-cv-{kind}-{index}"
+    """Build the panel's own endpointId for an item, from its index."""
+    return f"{panel_id}-{_KIND_WORD[kind]}-{index}"
 
 
 def _parse_cv_endpoint_id(endpoint_id: str) -> tuple[str, int] | None:
-    """Extract (kind, index) from a cv endpointId or return None."""
-    # Format: {panel_id}-cv-{kind}-{index}
-    # kind is one of: area, zone, out, scene
-    for kind in ("area", "zone", "out", "scene"):
-        marker = f"-cv-{kind}-"
+    """Extract (kind, index) from an endpointId or return None."""
+    for kind, word in _KIND_WORD.items():
+        marker = f"-{word}-"
         if marker in endpoint_id:
-            tail = endpoint_id.split(marker, 1)[1]
+            tail = endpoint_id.rsplit(marker, 1)[1]
             try:
                 return kind, int(tail)
             except ValueError:

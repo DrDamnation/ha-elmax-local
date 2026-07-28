@@ -78,10 +78,11 @@ def panel_transport(hass):
 # ---------------------------------------------------------------------------
 
 def test_cv_endpoint_id_format():
-    assert _cv_endpoint_id("pid", "area", 2) == "pid-cv-area-2"
-    assert _cv_endpoint_id("pid", "zone", 0) == "pid-cv-zone-0"
-    assert _cv_endpoint_id("pid", "out", 5) == "pid-cv-out-5"
-    assert _cv_endpoint_id("pid", "scene", 1) == "pid-cv-scene-1"
+    # The panel's own vocabulary, shared with the official transport.
+    assert _cv_endpoint_id("pid", "area", 2) == "pid-area-2"
+    assert _cv_endpoint_id("pid", "zone", 0) == "pid-zona-0"
+    assert _cv_endpoint_id("pid", "out", 5) == "pid-uscita-5"
+    assert _cv_endpoint_id("pid", "scene", 1) == "pid-scenario-1"
 
 
 def test_parse_cv_endpoint_id_roundtrip():
@@ -92,8 +93,8 @@ def test_parse_cv_endpoint_id_roundtrip():
 
 
 def test_parse_cv_endpoint_id_unknown():
-    assert _parse_cv_endpoint_id("other-panel-area-0") is None
     assert _parse_cv_endpoint_id("garbage") is None
+    assert _parse_cv_endpoint_id("pid-area-notanumber") is None
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +174,7 @@ async def test_fetch_state_ok(panel_transport):
     aree = result.get("aree", [])
     assert len(aree) == 1
     a = aree[0]
-    assert a["endpointId"] == f"{_PANEL_ID}-cv-area-0"
+    assert a["endpointId"] == f"{_PANEL_ID}-area-0"
     assert a["stato"] == 0        # armed=0 → disarmed
     assert a["nome"] == "Interno" # from widgets type=1 index=0
     assert a["visibile"] is True
@@ -183,7 +184,7 @@ async def test_fetch_state_ok(panel_transport):
     zone = result.get("zone", [])
     assert len(zone) == 1
     z = zone[0]
-    assert z["endpointId"] == f"{_PANEL_ID}-cv-zone-0"
+    assert z["endpointId"] == f"{_PANEL_ID}-zona-0"
     assert z["aperta"] is False
     assert z["esclusa"] is False
     assert z["visibile"] is True
@@ -192,7 +193,7 @@ async def test_fetch_state_ok(panel_transport):
     uscite = result.get("uscite", [])
     assert len(uscite) == 1
     o = uscite[0]
-    assert o["endpointId"] == f"{_PANEL_ID}-cv-out-0"
+    assert o["endpointId"] == f"{_PANEL_ID}-uscita-0"
     assert o["aperta"] is False   # on=False
     assert o["nome"] == "USCITA 1"
 
@@ -200,7 +201,7 @@ async def test_fetch_state_ok(panel_transport):
     scenari = result.get("scenari", [])
     assert len(scenari) == 1
     s = scenari[0]
-    assert s["endpointId"] == f"{_PANEL_ID}-cv-scene-0"
+    assert s["endpointId"] == f"{_PANEL_ID}-scenario-0"
     assert s["nome"] == "SCENARIO 1"
 
 
@@ -565,3 +566,40 @@ async def test_real_schema_keeps_bypass_and_armed(hass):
     result = _translate_real(hass)
     assert [z["esclusa"] for z in result["zone"]] == [False, True]
     assert [a["stato"] for a in result["aree"]] == [0, 4]
+
+
+# --- Endpoint identity shared with the official transport ---
+
+def test_endpoint_ids_match_the_official_scheme():
+    """Ids must be the panel's own, so entities survive a transport switch.
+
+    Captured from /api/v2/discovery on the live panel: areas are
+    "{panel_id}-area-{i}", zones "-zona-", outputs "-uscita-",
+    scenarios "-scenario-".
+    """
+    pid = "18352599c53cd0b93ec"
+    assert _cv_endpoint_id(pid, "area", 0) == f"{pid}-area-0"
+    assert _cv_endpoint_id(pid, "zone", 1) == f"{pid}-zona-1"
+    assert _cv_endpoint_id(pid, "out", 7) == f"{pid}-uscita-7"
+    assert _cv_endpoint_id(pid, "scene", 0) == f"{pid}-scenario-0"
+
+
+def test_endpoint_ids_round_trip():
+    """Commands route by parsing the id back, so it must survive the trip."""
+    pid = "18352599c53cd0b93ec"
+    for kind, index in (("area", 0), ("zone", 12), ("out", 7), ("scene", 9)):
+        assert _parse_cv_endpoint_id(_cv_endpoint_id(pid, kind, index)) == (kind, index)
+
+
+def test_parse_endpoint_id_rejects_junk():
+    assert _parse_cv_endpoint_id("nonsense") is None
+    assert _parse_cv_endpoint_id("abc-area-notanumber") is None
+
+
+async def test_translate_emits_official_ids(hass):
+    """End to end: a translated poll carries ids the other transports also use."""
+    result = _translate_real(hass)
+    assert result["aree"][0]["endpointId"] == "abc-area-0"
+    assert result["zone"][0]["endpointId"] == "abc-zona-0"
+    assert result["uscite"][0]["endpointId"] == "abc-uscita-7"
+    assert result["scenari"][0]["endpointId"] == "abc-scenario-0"
