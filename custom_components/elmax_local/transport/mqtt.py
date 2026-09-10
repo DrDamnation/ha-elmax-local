@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from homeassistant.components import mqtt
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 
 from ..const import (
     TOPIC_REQUEST_COMMAND, TOPIC_REQUEST_ID, TOPIC_REQUEST_STATUS,
@@ -28,7 +29,21 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-PROBE_TIMEOUT = 5
+# Overall budget for a probe. Must stay under TransportRegistry's
+# PROBE_HARD_TIMEOUT (12s), which is the outer belt-and-braces.
+PROBE_TIMEOUT = 9
+# Wait for the panel's answer before asking again. The request is
+# republished because a single QoS-0 PUBLISH that nobody is subscribed to
+# is gone for good: the answer is never retained and cannot be recovered.
+PROBE_REPLY_WAIT = 2
+# How long to wait for the broker to confirm our subscription before
+# asking anyway. Asking blind is still better than not asking at all, and
+# the republish loop covers what the confirmation would have covered.
+SUBSCRIBE_CONFIRM_WAIT = 3
+# Fallback for an HA without a public 'subscription is live' signal: a
+# grace period longer than HA's INITIAL_SUBSCRIBE_COOLDOWN (0.5s).
+SUBSCRIBE_BLIND_GRACE = 1.0
+
 STATUS_TIMEOUT = 8
 COMMAND_TIMEOUT = 5
 
@@ -53,32 +68,140 @@ class MqttTransport(Transport):
         self._command_event = asyncio.Event()
         self._command_response: dict | None = None
         self._pending_tasks: list[asyncio.Task] = []
+        self._retained_warned = False
 
     @property
     def state(self) -> TransportState:
         return self._state
 
     async def async_probe(self) -> bool:
-        event = asyncio.Event()
+        """Ask the panel to identify itself over MQTT.
+
+        The probe has to survive a broker that has not accepted our
+        subscription yet, a broker that is not even connected yet (HA and
+        mosquitto booting together on the same box) and a panel that answers
+        late. It therefore subscribes first and waits for that subscription
+        to be live, then republishes the request until the window runs out,
+        and never lets a broker error escape as an exception.
+        """
+        answered = asyncio.Event()
+        subscribed = asyncio.Event()
+        responders: set[str] = set()
 
         @callback
-        def _on_id(msg):
+        def _on_id(msg) -> None:
+            if getattr(msg, "retain", False):
+                return  # a stored snapshot proves nothing about liveness
             try:
                 data = json.loads(msg.payload)
-                if "centrale" in data:
-                    event.set()
             except (json.JSONDecodeError, ValueError):
-                pass
+                return
+            if not isinstance(data, dict):
+                return
+            centrale = data.get("centrale")
+            if centrale is None:
+                return
+            responders.add(str(centrale))
+            # /elmax/response/id is panel-agnostic and this broker is bridged
+            # to another one: only OUR panel answering validates the probe.
+            if str(centrale) == self._panel_id:
+                answered.set()
 
-        unsub = await mqtt.async_subscribe(self._hass, TOPIC_RESPONSE_ID, _on_id)
         try:
-            await mqtt.async_publish(self._hass, TOPIC_REQUEST_ID, "{}")
-            await asyncio.wait_for(event.wait(), timeout=PROBE_TIMEOUT)
-            return True
-        except asyncio.TimeoutError:
+            unsub = await mqtt.async_subscribe(
+                self._hass, TOPIC_RESPONSE_ID, _on_id, qos=0
+            )
+        except HomeAssistantError as err:
+            _LOGGER.debug("mqtt probe: cannot subscribe (%s)", err)
+            return False
+
+        cancel_watch = self._async_watch_subscription(
+            TOPIC_RESPONSE_ID, subscribed
+        )
+        confirmed = False
+        published = 0
+        try:
+            async with asyncio.timeout(PROBE_TIMEOUT):
+                confirmed = await self._async_await_subscription(subscribed)
+                while True:
+                    try:
+                        await mqtt.async_publish(
+                            self._hass, TOPIC_REQUEST_ID, "{}", qos=0
+                        )
+                    except HomeAssistantError as err:
+                        # Broker not connected yet: it may still come up
+                        # inside the window, so keep trying.
+                        _LOGGER.debug(
+                            "mqtt probe: broker refused the request (%s), "
+                            "retrying", err,
+                        )
+                        await asyncio.sleep(PROBE_REPLY_WAIT)
+                        continue
+                    published += 1
+                    try:
+                        await asyncio.wait_for(
+                            answered.wait(), PROBE_REPLY_WAIT
+                        )
+                    except (asyncio.TimeoutError, TimeoutError):
+                        continue
+                    return True
+        except (asyncio.TimeoutError, TimeoutError):
             return False
         finally:
+            cancel_watch()
             unsub()
+            # Everything needed to tell a lost race from a mute panel.
+            _LOGGER.debug(
+                "mqtt probe done: subscription_confirmed=%s requests=%d "
+                "answered=%s responders=%s",
+                confirmed, published, answered.is_set(),
+                sorted(responders) or "none",
+            )
+
+    def _async_watch_subscription(self, topic: str, subscribed: asyncio.Event):
+        """Set `subscribed` once our SUBSCRIBE has reached the broker.
+
+        `mqtt.async_subscribe` does not put the SUBSCRIBE on the wire: it
+        registers the callback in memory and schedules a debounced job
+        (INITIAL_SUBSCRIBE_COOLDOWN = 0.5s at startup, pushed further out by
+        every other integration that subscribes meanwhile). Publishing before
+        that job has run means the panel answers into a topic nobody is
+        subscribed to, and a non-retained QoS-0 message with no subscriber is
+        discarded by the broker, permanently.
+
+        Returns a callable that cancels the watch.
+        """
+        @callback
+        def _done(*_args) -> None:
+            subscribed.set()
+
+        on_subscribe_done = getattr(mqtt, "async_on_subscribe_done", None)
+        if on_subscribe_done is not None:
+            try:
+                cancel = on_subscribe_done(self._hass, topic, 0, _done)
+                # The watch is armed either way; only the canceller may be
+                # missing, and a TypeError in the probe's finally block would
+                # swallow its result.
+                return cancel if callable(cancel) else (lambda: None)
+            except Exception as err:  # unexpected signature or behaviour
+                _LOGGER.debug(
+                    "mqtt probe: async_on_subscribe_done unusable (%s), "
+                    "using a timed grace period", err,
+                )
+        # Older HA has no public signal for this. A grace period longer than
+        # the cooldown covers the common case; the republish loop covers the
+        # rest.
+        handle = self._hass.loop.call_later(SUBSCRIBE_BLIND_GRACE, _done)
+        return handle.cancel
+
+    @staticmethod
+    async def _async_await_subscription(subscribed: asyncio.Event) -> bool:
+        """True if the subscription was confirmed inside the window."""
+        try:
+            await asyncio.wait_for(subscribed.wait(), SUBSCRIBE_CONFIRM_WAIT)
+            return True
+        except (asyncio.TimeoutError, TimeoutError):
+            return False
 
     async def async_start(self, auth, on_state_update) -> None:
         self._auth = auth
@@ -110,6 +233,16 @@ class MqttTransport(Transport):
 
     @callback
     def _handle_status_message(self, msg) -> None:
+        if getattr(msg, "retain", False):
+            # A retained message is whatever the broker still had stored on
+            # the topic, replayed the instant we subscribe. It is not a push
+            # and carries no timestamp we trust: on this installation the
+            # stored snapshot is months old and shows every area disarmed.
+            # Ingesting it would put a false state on an alarm panel AND
+            # mark the coordinator fresh, suppressing the reconciliation
+            # poll that would have corrected it.
+            self._log_dropped_retained(msg)
+            return
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, ValueError):
@@ -133,8 +266,35 @@ class MqttTransport(Transport):
         self._status_response = data
         self._status_event.set()
 
+    def _log_dropped_retained(self, msg) -> None:
+        """Say once, loudly, what was dropped and how old it was."""
+        stamp = ""
+        try:
+            payload = json.loads(msg.payload)
+            stamp = (payload.get("status") or {}).get("datetime", "")
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            pass
+        topic = getattr(msg, "topic", "?")
+        if self._retained_warned:
+            _LOGGER.debug("Ignored retained message on %s (panel time %s)",
+                          topic, stamp or "unknown")
+            return
+        self._retained_warned = True
+        _LOGGER.warning(
+            "Ignoring RETAINED message on %s (panel time: %s). A retained "
+            "message is the snapshot the broker had stored, not a live "
+            "update, and it may be arbitrarily old; state will come from "
+            "the next live push or from the reconciliation poll. Clear the "
+            "retained message on the broker to silence this.",
+            topic, stamp or "unknown",
+        )
+
     @callback
     def _handle_command_message(self, msg) -> None:
+        if getattr(msg, "retain", False):
+            # A stored command reply would confirm a command that never ran.
+            self._log_dropped_retained(msg)
+            return
         try:
             self._command_response = json.loads(msg.payload)
             self._command_event.set()

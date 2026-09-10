@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth import AuthManager
@@ -26,6 +26,16 @@ _LOGGER = logging.getLogger(__name__)
 
 PUSH_FRESHNESS_RATIO = 0.5  # skip poll if push < interval*0.5 ago
 POST_COMMAND_WAIT = 3
+
+# Reconcile ticks on which transports that failed their probe are given
+# another chance, then every REPROBE_EVERY_TICKS. Tick 1 is the setup
+# refresh, which happens milliseconds after the initial probe: retrying
+# there would only re-ask a panel that just did not answer. At the
+# default 90s interval this is roughly +90s, +4min, +10min, +24min, then
+# every 24 minutes -- enough to catch a late broker without hammering a
+# panel that is simply mute.
+REPROBE_TICKS = (2, 4, 8, 16)
+REPROBE_EVERY_TICKS = 16
 
 
 @dataclass
@@ -73,6 +83,8 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         if enable_panel and cv_host:
             transports.append(PanelTransport(hass, panel_id, cv_host, pin))
         self.registry = TransportRegistry(transports)
+        self._tick = 0
+        self._reprobe_task: asyncio.Task | None = None
 
     async def async_setup(self) -> None:
         """Called by async_setup_entry. Task 15 wires this."""
@@ -80,6 +92,8 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         await self.async_config_entry_first_refresh()
 
     async def async_shutdown(self) -> None:
+        if self._reprobe_task is not None and not self._reprobe_task.done():
+            self._reprobe_task.cancel()
         await self.registry.async_stop_all()
         await self.auth.async_close()
 
@@ -114,8 +128,41 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
         new_state = self._parse(raw, source=source)
         self.async_set_updated_data(new_state)
 
+    @callback
+    def _async_schedule_reprobe(self) -> None:
+        """Give transports that failed their probe another chance.
+
+        Runs off the reconcile tick, in the background so a slow probe never
+        delays the poll, and before the push-freshness shortcut: a healthy
+        websocket must not keep a repairable transport excluded for ever.
+        """
+        self._tick += 1
+        if (self._tick not in REPROBE_TICKS
+                and self._tick % REPROBE_EVERY_TICKS):
+            return
+        if self._reprobe_task is not None and not self._reprobe_task.done():
+            return
+        self._reprobe_task = self.hass.async_create_task(
+            self._async_reprobe(),
+            name=f"elmax_local transport re-probe {self.panel_id}",
+        )
+
+    async def _async_reprobe(self) -> None:
+        try:
+            recovered = await self.registry.async_reprobe_inactive(
+                self.auth, self._on_push_state_update
+            )
+        except Exception as err:
+            # Never let a re-probe take the coordinator down with it.
+            _LOGGER.debug("Transport re-probe failed: %s", err)
+            return
+        if recovered:
+            _LOGGER.info("Transports back in service: %s",
+                         ", ".join(recovered))
+
     async def _async_update_data(self) -> ElmaxState:
         """Reconciliation poll. Skipped if push is fresh."""
+        self._async_schedule_reprobe()
         if self._push_is_fresh():
             return self.data
         raw = await self.registry.async_fetch_state()

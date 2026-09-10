@@ -98,6 +98,10 @@ class TransportRegistry:
     # Priority order for POLL and COMMAND fallback.
     # "panel" (C315 bridge) is intentionally LAST: it is the wired fallback
     # that succeeds when the official API / MQTT are unavailable.
+    # NOTE: mqtt only ever enters these lists once it reaches READY. Until
+    # the probe was fixed it never did, so the mqtt COMMAND path has never
+    # actually carried an arm/disarm in production. Drop "mqtt" from
+    # _COMMAND_PRIORITY if you would rather validate that path first.
     _POLL_PRIORITY = ("http", "mqtt", "websocket", "panel")
     _COMMAND_PRIORITY = ("http", "mqtt", "panel")
 
@@ -109,6 +113,27 @@ class TransportRegistry:
     # network stack could still hang; the outer 12s is the belt-and-braces.
     PROBE_HARD_TIMEOUT = 12
 
+    async def _async_probe_one(
+        self, t: Transport, auth: "AuthManager",
+    ) -> tuple[Transport, bool]:
+        # Give the transport access to AuthManager *before* probing, since
+        # HTTP/WS probes hit /login which goes through auth.
+        t._auth = auth  # noqa: SLF001 — intentional contract per Registry
+        try:
+            ok = await asyncio.wait_for(
+                t.async_probe(), timeout=self.PROBE_HARD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Transport %s probe timed out after %ds",
+                t.name, self.PROBE_HARD_TIMEOUT,
+            )
+            ok = False
+        except Exception as err:
+            _LOGGER.warning("Transport %s probe error: %s", t.name, err)
+            ok = False
+        return t, ok
+
     async def async_start_all(
         self,
         auth: "AuthManager",
@@ -118,27 +143,8 @@ class TransportRegistry:
         # transport (e.g. unreachable panel) could otherwise add seconds to
         # bootstrap. Each probe is wrapped in PROBE_HARD_TIMEOUT so one bad
         # transport cannot stall the others.
-        async def _probe_one(t: Transport) -> tuple[Transport, bool]:
-            # Give the transport access to AuthManager *before* probing, since
-            # HTTP/WS probes hit /login which goes through auth.
-            t._auth = auth  # noqa: SLF001 — intentional contract per Registry
-            try:
-                ok = await asyncio.wait_for(
-                    t.async_probe(), timeout=self.PROBE_HARD_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Transport %s probe timed out after %ds",
-                    t.name, self.PROBE_HARD_TIMEOUT,
-                )
-                ok = False
-            except Exception as err:
-                _LOGGER.warning("Transport %s probe error: %s", t.name, err)
-                ok = False
-            return t, ok
-
         results = await asyncio.gather(
-            *(_probe_one(t) for t in self._transports)
+            *(self._async_probe_one(t, auth) for t in self._transports)
         )
         for t, ok in results:
             if ok:
@@ -148,8 +154,54 @@ class TransportRegistry:
                     _LOGGER.warning("Transport %s failed to start: %s",
                                     t.name, err)
             else:
-                _LOGGER.info("Transport %s probe failed, marking UNSUPPORTED",
-                             t.name)
+                # NOT "UNSUPPORTED": nothing here assigns that state, and it
+                # would mean "never retry". The transport stays DISABLED,
+                # which is what async_reprobe_inactive comes back for. The
+                # old wording said the opposite of what the code did and is
+                # why a whole earlier fix looked at the wrong state.
+                _LOGGER.info(
+                    "Transport %s probe failed; left DISABLED, will be "
+                    "retried periodically", t.name,
+                )
+
+    async def async_reprobe_inactive(
+        self,
+        auth: "AuthManager",
+        on_state_update: StateUpdateCallback,
+    ) -> list[str]:
+        """Re-probe transports that never came up, and start the ones that
+        now answer. Returns the names recovered.
+
+        Without this a transport that lost its probe at boot — broker still
+        connecting, panel still booting, network not up — stays out until the
+        config entry is reloaded, because the probe has a single call site in
+        async_setup. Transports that are READY or DEGRADED are left strictly
+        alone: DEGRADED recovers by being called, not by being re-probed.
+        """
+        inactive = [t for t in self._transports
+                    if t.state is TransportState.DISABLED]
+        if not inactive:
+            return []
+
+        results = await asyncio.gather(
+            *(self._async_probe_one(t, auth) for t in inactive)
+        )
+        recovered: list[str] = []
+        for t, ok in results:
+            if not ok:
+                continue
+            try:
+                await t.async_start(auth, on_state_update)
+            except Exception as err:
+                _LOGGER.warning(
+                    "Transport %s answered a re-probe but failed to start: %s",
+                    t.name, err,
+                )
+                continue
+            recovered.append(t.name)
+            _LOGGER.info("Transport %s recovered (now %s)",
+                         t.name, t.state.value)
+        return recovered
 
     async def async_stop_all(self) -> None:
         for t in self._transports:
