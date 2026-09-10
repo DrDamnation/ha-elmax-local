@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import async_fire_mqtt_message
 
-from custom_components.elmax_local.auth import AuthManager
+from custom_components.elmax_local.auth import AuthManager, ElmaxAuthError
 from custom_components.elmax_local.const import (
-    TOPIC_REQUEST_ID, TOPIC_RESPONSE_ID, TOPIC_RESPONSE_STATUS,
+    TOPIC_REQUEST_COMMAND, TOPIC_REQUEST_ID, TOPIC_REQUEST_STATUS,
+    TOPIC_RESPONSE_COMMAND, TOPIC_RESPONSE_ID, TOPIC_RESPONSE_STATUS,
 )
 from custom_components.elmax_local.transport import (
     TransportCapability, TransportState,
@@ -44,6 +47,25 @@ OTHER_PANEL_REPLY = json.dumps({
     "tipo_accessorio": "VideoBox",
 })
 
+STATUS_REQ_TOPIC = TOPIC_REQUEST_STATUS.format(panel_id=PANEL_ID)
+STATUS_RESP_TOPIC = TOPIC_RESPONSE_STATUS.format(panel_id=PANEL_ID)
+COMMAND_REQ_TOPIC = TOPIC_REQUEST_COMMAND.format(panel_id=PANEL_ID)
+COMMAND_RESP_TOPIC = TOPIC_RESPONSE_COMMAND.format(panel_id=PANEL_ID)
+
+PANEL_STATUS = {
+    "centrale": PANEL_ID,
+    "release": "PHANTOM64PRO_GSM 13.9L.844",
+    "zone": [], "aree": [], "uscite": [], "scenari": [],
+    "datetime": "10:50:00 10/09/2026",
+}
+# "200 Status Update" on purpose: it is the ONLY message string ever
+# observed from this panel. The reply to a request has never been measured,
+# so nothing may gate on "200 Status OK".
+STATUS_REPLY = json.dumps({"message": "200 Status Update",
+                           "status": PANEL_STATUS})
+STATUS_401_REPLY = json.dumps({"message": "401 Unauthorized"})
+COMMAND_OK_REPLY = json.dumps({"message": "200 Command OK"})
+
 
 @pytest.fixture
 async def auth(hass):
@@ -60,14 +82,20 @@ def mqtt_transport(hass, auth):
 
 
 class _Broker:
-    """Records the wire and answers /elmax/request/id like the panel does."""
+    """Records the wire and answers /elmax/request/* like the panel does."""
 
     def __init__(self):
         self.wire: list[tuple[str, str]] = []
         self.on_wire: set[str] = set()
         self.reply: str | None = ID_REPLY
+        self.retain = False
         self.requests = 0
         self.dropped = 0
+        self.status_reply: str | None = STATUS_REPLY
+        self.status_requests = 0
+        # The panel ignores everything before this request number: models a
+        # request that was published but never answered.
+        self.answer_status_from = 1
 
 
 @pytest.fixture
@@ -85,27 +113,45 @@ def qos0_broker(hass, mqtt_mock, mqtt_client_mock):
             broker.wire.append(("SUBSCRIBE", name))
         return orig_sub(topic, qos)
 
+    def _deliver(response_topic: str, reply: str, retain: bool = False) -> None:
+        if reply is None:
+            return
+        if response_topic in broker.on_wire:
+            # Subscriber present at this instant -> mosquitto delivers.
+            hass.loop.call_soon(
+                async_fire_mqtt_message, hass,
+                response_topic, reply, 0, retain,
+            )
+        else:
+            # No subscriber: a non-retained QoS-0 message is discarded
+            # and is NOT recoverable by a later subscription.
+            broker.dropped += 1
+
     def _publish(topic, payload=None, qos=0, retain=False, *args, **kwargs):
         broker.wire.append(("PUBLISH", topic))
         if topic == TOPIC_REQUEST_ID:
             broker.requests += 1
-            if broker.reply is None:
-                pass
-            elif TOPIC_RESPONSE_ID in broker.on_wire:
-                # Subscriber present at this instant -> mosquitto delivers.
-                hass.loop.call_soon(
-                    async_fire_mqtt_message, hass,
-                    TOPIC_RESPONSE_ID, broker.reply,
-                )
-            else:
-                # No subscriber: a non-retained QoS-0 message is discarded
-                # and is NOT recoverable by a later subscription.
-                broker.dropped += 1
+            _deliver(TOPIC_RESPONSE_ID, broker.reply, broker.retain)
+        elif topic == STATUS_REQ_TOPIC:
+            broker.status_requests += 1
+            if broker.status_requests >= broker.answer_status_from:
+                _deliver(STATUS_RESP_TOPIC, broker.status_reply)
         return orig_pub(topic, payload, qos, retain)
 
     mqtt_client_mock.subscribe.side_effect = _subscribe
     mqtt_client_mock.publish.side_effect = _publish
     return broker
+
+
+async def _let_the_mqtt_misc_timer_fire() -> None:
+    """Fixture artifact, nothing to do with the transport.
+
+    With paho mocked, HA's MQTT misc timer fires once and then stops
+    (loop_misc returns a Mock, never MQTT_ERR_SUCCESS). A test fast enough
+    to end while that timer is still armed trips HA's "lingering timer"
+    cleanup check. Let it fire.
+    """
+    await asyncio.sleep(1.05)
 
 
 def test_capabilities(mqtt_transport):
@@ -270,11 +316,7 @@ async def test_retained_status_from_the_broker_never_reaches_coordinator(
 
     await mqtt_transport.async_stop()
     await hass.async_block_till_done()
-    # With paho mocked, MQTT's misc timer fires once and then stops
-    # (loop_misc returns a Mock, never MQTT_ERR_SUCCESS). This test is fast
-    # enough to end while it is still armed, which HA's cleanup check treats
-    # as a leak; let it fire. Nothing about the transport depends on this.
-    await asyncio.sleep(1.05)
+    await _let_the_mqtt_misc_timer_fire()
 
 
 async def test_retained_command_reply_does_not_confirm_a_command(
@@ -344,3 +386,311 @@ async def test_probe_survives_a_broken_subscribe_done_api(
          patch.object(mqtt_module.mqtt, "async_on_subscribe_done",
                       new=_broken, create=True):
         assert await mqtt_transport.async_probe() is True
+
+
+# --- The data path: fetch_state (C1, C4, C5, C11) ----------------------
+# These were completely uncovered: 14 tests guarded the gate (the probe)
+# and none the function the whole fix exists for.
+
+
+@pytest.fixture
+def instant_panel(hass, mqtt_transport):
+    """A panel that answers in the same tick, without going through HA mqtt.
+
+    Used where the point is the transport's own logic (401, auth, command
+    handling), not delivery. SUBSCRIBE_CONFIRM_WAIT is shortened because
+    these tests skip the real subscriptions on purpose.
+    """
+    class _Panel:
+        def __init__(self):
+            self.status_requests: list[str] = []
+            self.command_requests: list[str] = []
+            self.status_reply: str | None = STATUS_REPLY
+            self.command_reply: str | None = COMMAND_OK_REPLY
+
+        async def publish(self, hass_arg, topic, payload=None, *args, **kwargs):
+            if topic == STATUS_REQ_TOPIC:
+                self.status_requests.append(payload)
+                self._answer(topic, self.status_reply,
+                             mqtt_transport._handle_status_message)
+            elif topic == COMMAND_REQ_TOPIC:
+                self.command_requests.append(payload)
+                self._answer(topic, self.command_reply,
+                             mqtt_transport._handle_command_message)
+
+        @staticmethod
+        def _answer(topic, reply, handler):
+            if reply is None:
+                return
+            msg = MagicMock(retain=False)
+            msg.topic = topic
+            msg.payload = reply
+            hass.loop.call_soon(handler, msg)
+
+    panel = _Panel()
+    with patch.object(mqtt_module.mqtt, "async_publish", new=panel.publish), \
+         patch.object(mqtt_module, "SUBSCRIBE_CONFIRM_WAIT", 0.05):
+        yield panel
+
+
+async def _start_offline(transport, auth):
+    """Start without touching HA's mqtt integration."""
+    with patch.object(transport, "_subscribe_responses", new=AsyncMock()):
+        await transport.async_start(auth, AsyncMock())
+
+
+async def test_fetch_state_returns_the_payload_and_marks_ready(
+        hass, qos0_broker, mqtt_transport, auth):
+    """The first poll after start must not lose the race against HA's
+    subscription debouncer: the panel answers, so the transport must return
+    that answer and report itself READY."""
+    await mqtt_transport.async_start(auth, AsyncMock())
+
+    result = await mqtt_transport.async_fetch_state()
+
+    assert result == PANEL_STATUS
+    assert mqtt_transport.state is TransportState.READY
+    assert qos0_broker.dropped == 0
+    await mqtt_transport.async_stop()
+    await hass.async_block_till_done()
+
+
+async def test_fetch_state_recovers_from_degraded_after_a_timeout(
+        hass, qos0_broker, mqtt_transport, auth):
+    """A single mute poll must not label mqtt 'degraded' for ever.
+
+    http.py:77 and panel.py both put the transport back to READY on a
+    successful fetch; mqtt only ever moved to DEGRADED, so the first timeout
+    was permanent until a reload -- and the diagnostics, the staleness line
+    and get_active_push_transports() all kept reporting a lie.
+    """
+    qos0_broker.status_reply = None  # panel mute
+    await mqtt_transport.async_start(auth, AsyncMock())
+
+    with patch.object(mqtt_module, "STATUS_TIMEOUT", 2):
+        assert await mqtt_transport.async_fetch_state() is None
+    assert mqtt_transport.state is TransportState.DEGRADED
+
+    qos0_broker.status_reply = STATUS_REPLY
+    assert await mqtt_transport.async_fetch_state() == PANEL_STATUS
+    assert mqtt_transport.state is TransportState.READY
+
+    await mqtt_transport.async_stop()
+    await hass.async_block_till_done()
+
+
+async def test_fetch_state_asks_again_inside_the_window(
+        hass, qos0_broker, mqtt_transport, auth):
+    """One QoS-0 request that nobody answers is gone: ask again.
+
+    The panel here ignores the first request; the answer to the second one
+    is inside the same 8s budget, so the poll must still succeed.
+    """
+    qos0_broker.answer_status_from = 2
+    await mqtt_transport.async_start(auth, AsyncMock())
+
+    with patch.object(mqtt_module, "STATUS_REPLY_WAIT", 1, create=True):
+        result = await mqtt_transport.async_fetch_state()
+
+    assert result == PANEL_STATUS
+    assert qos0_broker.status_requests >= 2
+    await mqtt_transport.async_stop()
+    await hass.async_block_till_done()
+
+
+async def test_fetch_state_on_401_degrades_without_waiting_out_the_window(
+        hass, mqtt_transport, auth, instant_panel):
+    """A 401 answer used to be dropped before waking the waiter: the panel
+    had already said no and the transport still sat there for 8 seconds,
+    then blamed a timeout. http.py handles 401 as 'DEGRADED, return None'."""
+    instant_panel.status_reply = STATUS_401_REPLY
+    await _start_offline(mqtt_transport, auth)
+
+    with patch.object(auth, "async_handle_401", new=AsyncMock()) as handled:
+        started = time.monotonic()
+        result = await mqtt_transport.async_fetch_state()
+        elapsed = time.monotonic() - started
+        await hass.async_block_till_done()
+
+    assert result is None
+    assert elapsed < 2, f"waited {elapsed:.1f}s for an answer already received"
+    assert mqtt_transport.state is TransportState.DEGRADED
+    handled.assert_awaited()
+
+
+async def test_fetch_state_auth_failure_does_not_leave_mqtt_ready(
+        hass, mqtt_transport, auth, instant_panel):
+    """MQTT still needs a JWT taken over HTTPS. When that fails the channel
+    is unusable, so it must not keep advertising itself as READY -- the
+    registry swallows the exception and nobody would ever notice."""
+    await _start_offline(mqtt_transport, auth)
+
+    with patch.object(auth, "async_get_token",
+                      new=AsyncMock(side_effect=ElmaxAuthError("backoff"))):
+        result = await mqtt_transport.async_fetch_state()
+
+    assert result is None
+    assert mqtt_transport.state is not TransportState.READY
+    assert instant_panel.status_requests == []
+
+
+async def test_fetch_state_records_which_message_answered_it(
+        hass, mqtt_transport, auth, instant_panel):
+    """Which message satisfied the poll is the open question of this whole
+    investigation ('the panel answers US' vs 'the panel just publishes'), so
+    record it. Deliberately no gate on the string: the reply to a request
+    has never been measured on this panel."""
+    await _start_offline(mqtt_transport, auth)
+
+    assert await mqtt_transport.async_fetch_state() == PANEL_STATUS
+    assert mqtt_transport.diagnostic_info()["last_fetch_message"] == (
+        "200 Status Update")
+
+
+# --- The data path: send_command (C5, C11) ------------------------------
+
+
+async def test_send_command_returns_ok_on_a_200_reply(
+        hass, mqtt_transport, auth, instant_panel):
+    await _start_offline(mqtt_transport, auth)
+
+    result = await mqtt_transport.async_send_command("abc123-uscita-0", "1")
+
+    assert result.ok is True
+    assert len(instant_panel.command_requests) == 1
+    body = json.loads(instant_panel.command_requests[0])
+    assert body["eid"] == "abc123-uscita-0" and body["cmd"] == "1"
+
+
+async def test_send_command_is_published_exactly_once(
+        hass, mqtt_transport, auth, instant_panel):
+    """A lost confirmation is NOT a lost command: the panel may have
+    executed it. A command must never be republished on a timeout."""
+    instant_panel.command_reply = None
+    await _start_offline(mqtt_transport, auth)
+
+    with patch.object(mqtt_module, "COMMAND_TIMEOUT", 1):
+        result = await mqtt_transport.async_send_command("abc123-area-0", "1")
+
+    assert result.ok is False and result.error == "timeout"
+    assert len(instant_panel.command_requests) == 1
+
+
+async def test_send_command_auth_failure_is_reported_not_raised(
+        hass, mqtt_transport, auth, instant_panel):
+    await _start_offline(mqtt_transport, auth)
+
+    with patch.object(auth, "async_get_token",
+                      new=AsyncMock(side_effect=ElmaxAuthError("backoff"))):
+        result = await mqtt_transport.async_send_command("abc123-area-0", "1")
+
+    assert result.ok is False
+    assert instant_panel.command_requests == []
+    assert mqtt_transport.state is not TransportState.READY
+
+
+async def test_send_command_without_start_is_not_started(mqtt_transport):
+    result = await mqtt_transport.async_send_command("abc123-area-0", "1")
+    assert result.ok is False and result.error == "not_started"
+
+
+# --- Subscriptions are not doubled by a re-probe (C9) -------------------
+
+
+async def test_starting_twice_does_not_double_the_subscriptions(
+        hass, qos0_broker, mqtt_transport, auth):
+    """async_start now has a second call site (the registry's re-probe).
+    Appending to self._unsubs left the old callback live, so every push
+    would be handled N times -- N coordinator updates per message."""
+    pushes = []
+
+    async def on_push(data):
+        pushes.append(data)
+
+    await mqtt_transport.async_start(auth, on_push)
+    await mqtt_transport.async_start(auth, on_push)  # what a re-probe does
+
+    assert len(mqtt_transport._unsubs) == 2
+
+    async_fire_mqtt_message(hass, STATUS_RESP_TOPIC, STATUS_REPLY, 0, False)
+    await hass.async_block_till_done()
+    await mqtt_transport._drain_pending()
+
+    assert pushes == [PANEL_STATUS]
+    await mqtt_transport.async_stop()
+    await hass.async_block_till_done()
+    await _let_the_mqtt_misc_timer_fire()
+
+
+# --- Push tasks must not pile up (C10) ---------------------------------
+
+
+async def test_finished_push_tasks_are_dropped(
+        hass, qos0_broker, mqtt_transport, auth):
+    """_drain_pending is a test helper; in production nothing pruned the
+    list, so a READY mqtt leaked one Task object per push, for ever."""
+    pushes = []
+
+    async def on_push(data):
+        pushes.append(data)
+
+    await mqtt_transport.async_start(auth, on_push)
+    for _ in range(3):
+        async_fire_mqtt_message(hass, STATUS_RESP_TOPIC, STATUS_REPLY, 0, False)
+    await hass.async_block_till_done()
+
+    assert len(pushes) == 3
+    assert not mqtt_transport._pending_tasks
+    await mqtt_transport.async_stop()
+    await hass.async_block_till_done()
+    await _let_the_mqtt_misc_timer_fire()
+
+
+# --- Retained messages: keep saying it, and count them (C6) ------------
+
+
+async def test_retained_warning_comes_back_after_the_throttle_window(
+        mqtt_transport, auth, caplog, mock_panel_data):
+    """Warning once per process would make a panel that pushes everything
+    retained look healthy and be completely mute, with one line buried in
+    the boot log."""
+    await _start_offline(mqtt_transport, auth)
+
+    msg = MagicMock(retain=True)
+    msg.topic = STATUS_RESP_TOPIC
+    msg.payload = json.dumps({"message": "200 Status Update",
+                              "status": mock_panel_data})
+
+    with caplog.at_level(logging.WARNING):
+        mqtt_transport._handle_status_message(msg)
+        mqtt_transport._handle_status_message(msg)
+    assert caplog.text.count("Ignoring RETAINED") == 1
+    assert mqtt_transport.diagnostic_info()["retained_dropped"] == 2
+
+    with caplog.at_level(logging.WARNING), \
+         patch.object(mqtt_module, "RETAINED_WARN_INTERVAL", 0):
+        mqtt_transport._handle_status_message(msg)
+    assert caplog.text.count("Ignoring RETAINED") == 2
+    assert mqtt_transport.diagnostic_info()["retained_dropped"] == 3
+
+
+# --- The probe must not report 'nobody answered' when somebody did (C8) --
+
+
+async def test_probe_reports_a_retained_reply_instead_of_no_responders(
+        hass, qos0_broker, mqtt_transport, caplog):
+    """A retained identification still does not prove the panel is alive, so
+    the probe rightly fails -- but the log line the deploy instructions tell
+    you to read must not say 'responders=none', which reads as 'the panel
+    ignores Home Assistant'."""
+    qos0_broker.retain = True
+
+    with caplog.at_level(
+            logging.DEBUG,
+            logger="custom_components.elmax_local.transport.mqtt"), \
+         patch.object(mqtt_module, "PROBE_TIMEOUT", 2):
+        assert await mqtt_transport.async_probe() is False
+
+    assert "responders=['" + PANEL_ID + "']" in caplog.text
+    assert "retained_replies=" in caplog.text
+    assert "retained_replies=0" not in caplog.text

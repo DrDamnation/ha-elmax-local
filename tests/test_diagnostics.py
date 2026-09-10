@@ -5,6 +5,9 @@ import time
 from unittest.mock import MagicMock
 
 from custom_components.elmax_local.diagnostics import async_get_config_entry_diagnostics
+from custom_components.elmax_local.transport import (
+    TransportCapability, TransportState,
+)
 
 
 async def test_diagnostics_redacts_pin(hass):
@@ -28,3 +31,42 @@ async def test_diagnostics_redacts_pin(hass):
     # _token is not part of raw dump shape, but expires_in derived from it
     # is exposed (no leak). Token value itself is never in dump.
     assert "JWT_TOKEN" not in str(dump)
+
+
+async def test_diagnostics_carries_each_transport_own_facts(hass):
+    """The downloadable diagnostics is the ONLY on-demand health channel.
+
+    The log speaks up only when something breaks, so "mqtt is READY and
+    silently dropping every message as retained" is invisible there. The
+    per-transport counters (retained_dropped, last_fetch_message) only
+    close that hole if the dump actually carries them.
+    """
+    entry = MagicMock()
+    entry.data = {"panel_pin": "000000"}
+    transport = MagicMock()
+    transport.name = "mqtt"
+    transport.state = TransportState.READY
+    transport.capabilities = frozenset({TransportCapability.POLL})
+    transport.diagnostic_info.return_value = {
+        "retained_dropped": 7, "last_fetch_message": "200 Status Update",
+    }
+    coord = MagicMock()
+    coord.panel_id = "abcdef"
+    coord.host = "1.2.3.4"
+    coord.data = MagicMock(
+        panel_info={}, zones={}, areas={}, outputs={}, scenarios={},
+        last_update_source="mqtt",
+    )
+    coord.auth = MagicMock(_token=None, _expiry=0, _login_fail_count=0,
+                           _blocked_until=0)
+    coord.registry = MagicMock()
+    coord.registry._transports = [transport]
+    hass.data["elmax_local"] = {entry.entry_id: coord}
+
+    dump = await async_get_config_entry_diagnostics(hass, entry)
+
+    mqtt_dump = dump["transports"][0]
+    assert mqtt_dump["name"] == "mqtt"
+    assert mqtt_dump["state"] == "ready"
+    assert mqtt_dump["retained_dropped"] == 7
+    assert mqtt_dump["last_fetch_message"] == "200 Status Update"

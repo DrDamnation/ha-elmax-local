@@ -154,6 +154,47 @@ Where `XXXXXX` is the last 6 characters of your panel ID. You can rename entitie
 - The JWT token has expired — the integration handles this automatically with re-login
 - If persistent, restart the integration from Settings > Devices & Services
 
+### Is the MQTT transport actually working?
+
+Do not judge this from the absence of an error in the log. Two channels
+report it positively:
+
+- **The log, once per start.** `Transports after start: http=ready,
+  mqtt=ready, websocket=ready` is written on every startup, success
+  included. A transport listed as `disabled` failed its probe and will be
+  retried periodically; `degraded` means its last exchange failed, and it
+  returns to `ready` on the next successful one.
+- **The diagnostics dump** (Settings > Devices & Services > Elmax Local >
+  ... > Download diagnostics) — the only channel that reports transport
+  health *on demand*. Per transport it carries `state`, and for MQTT also:
+  - `last_fetch_message` — which message satisfied the last poll. This is
+    the field that separates "the panel answers our requests" from "the
+    panel publishes on its own and we happened to catch one".
+  - `retained_dropped` — retained messages ignored (see below). Climbing
+    steadily while `state` is `ready` means the channel is delivering
+    nothing usable.
+  - `status_subscription_confirmed` — whether our SUBSCRIBE actually
+    reached the broker.
+
+  At the top level, `last_update_source` names the transport that pushed
+  the state currently in use.
+
+### "Ignoring RETAINED message on /elmax/response/status/..."
+
+A retained message is the snapshot the broker had stored on that topic and
+replays to every new subscriber. It is not a live update and can be
+arbitrarily old, so it is dropped on purpose: ingesting it would put a
+stale state on an alarm panel *and* mark the data fresh, suppressing the
+reconciliation poll that would have corrected it. The warning repeats at
+most every 10 minutes; `retained_dropped` in the diagnostics counts every
+drop.
+
+To clear it, publish an empty retained payload on that topic. **If your
+broker is bridged to another one, clear it on the remote broker first.** A
+bridge configured with `topic # both` re-imports the retained message as
+soon as it reconnects, so cleaning only the local broker appears to work
+and then silently undoes itself.
+
 ## Compatibility
 
 | Panel | Tested | Notes |

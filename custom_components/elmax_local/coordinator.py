@@ -29,10 +29,14 @@ POST_COMMAND_WAIT = 3
 # Reconcile ticks on which transports that failed their probe are given
 # another chance, then every REPROBE_EVERY_TICKS. Tick 1 is the setup
 # refresh, which happens milliseconds after the initial probe: retrying
-# there would only re-ask a panel that just did not answer. At the
-# default 90s interval this is roughly +90s, +4min, +10min, +24min, then
-# every 24 minutes -- enough to catch a late broker without hammering a
-# panel that is simply mute.
+# there would only re-ask a panel that just did not answer.
+#
+# These are UPDATE COUNTS, not a clock. On an idle system at the default
+# 90s interval they land around +90s, +4min, +10min, +24min and then every
+# 24 minutes, but every successful command adds a tick of its own
+# (_post_command_verify calls async_request_refresh), so a busy afternoon
+# makes the re-probes come sooner in wall-clock terms. That errs towards
+# recovering faster, which is the harmless direction.
 REPROBE_TICKS = (2, 4, 8, 16)
 REPROBE_EVERY_TICKS = 16
 
@@ -114,10 +118,17 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
             last_update_ts=time.time(),
         )
 
-    async def _on_push_state_update(self, raw: dict) -> None:
-        """Called by PUSH transports on each spontaneous state update."""
-        push = self.registry.get_active_push_transports()
-        source = push[0].name if push else "push"
+    async def _on_push_state_update(self, raw: dict, source: str = "push") -> None:
+        """Called by PUSH transports on each spontaneous state update.
+
+        `source` is bound by TransportRegistry to the transport that is
+        actually pushing. It used to be guessed as "the first READY push
+        transport", which credited mqtt for websocket pushes the moment mqtt
+        came up -- a wrong answer in the one field (diagnostics'
+        last_update_source) someone would read to decide whether MQTT push
+        works. The default is deliberately the neutral "push", never a
+        transport name.
+        """
         new_state = self._parse(raw, source=source)
         self.async_set_updated_data(new_state)
 
@@ -167,8 +178,7 @@ class ElmaxLocalCoordinator(DataUpdateCoordinator[ElmaxState]):
                 interval = (self.update_interval.total_seconds()
                             if self.update_interval else DEFAULT_RECONCILE_INTERVAL)
                 stale_for = time.time() - self.data.last_update_ts
-                transports = ", ".join(f"{t.name}={t.state.value}"
-                                       for t in self.registry._transports)
+                transports = self.registry.state_summary()
                 if stale_for > STALE_UNAVAILABLE_RATIO * interval:
                     # Past this point the cached state is not trustworthy:
                     # surface it as unavailable instead of serving an alarm

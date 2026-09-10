@@ -6,6 +6,7 @@ Concrete implementations in transport/http.py, mqtt.py, websocket.py.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -15,7 +16,10 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 if TYPE_CHECKING:
     from ..auth import AuthManager
 
-StateUpdateCallback = Callable[[dict], Awaitable[None]]
+# Transports call this with the raw payload only: cb(raw). The registry
+# binds the caller's identity before handing it over (cb(raw, source=name)),
+# so the coordinator never has to guess which channel pushed.
+StateUpdateCallback = Callable[..., Awaitable[None]]
 
 
 class TransportCapability(Enum):
@@ -70,6 +74,16 @@ class Transport(ABC):
     async def async_stop(self) -> None:
         """Stop. Idempotent. Restartable with async_start."""
 
+    def diagnostic_info(self) -> dict:
+        """Transport-specific facts for the diagnostics dump.
+
+        The downloadable diagnostics is the only channel that reports a
+        transport's health on demand (the log only speaks when something
+        breaks), so anything needed to tell "working" from "silently doing
+        nothing" belongs here. Default: nothing to add.
+        """
+        return {}
+
     async def async_fetch_state(self) -> dict | None:
         """On-demand fetch (POLL capability). Default raise."""
         raise NotImplementedError(f"{self.name} does not support POLL")
@@ -92,17 +106,29 @@ class Transport(ABC):
 _LOGGER = logging.getLogger(__name__)
 
 
+# Whether MQTT is allowed to carry commands (arm/disarm/outputs/scenarios).
+#
+# Deliberately False, pending the owner's decision (D1). The MQTT command
+# path has never carried a command in production, it publishes exactly once
+# with no request/response correlation, and its 5s wait is for a
+# confirmation only: if that confirmation is lost the PANEL MAY HAVE
+# EXECUTED the command while HA reports a failure -- on an inhabited house
+# that means a silent arm or disarm, or a human retry that sends it twice.
+# It also still needs a token obtained over HTTPS, so as a fallback during
+# an HTTP outage it buys very little.
+#
+# Flipping this to True is the whole change needed to put it back in the
+# rotation, once the path has been exercised and correlated.
+MQTT_MAY_CARRY_COMMANDS = False
+
+
 class TransportRegistry:
     """Orchestrates N transports. Routes operations by capability + state."""
 
     # Priority order for POLL and COMMAND fallback.
     # NOTE: mqtt only ever enters these lists once it reaches READY.
-    # Until the probe was fixed it never did, so the mqtt COMMAND path
-    # has never actually carried an arm/disarm in production. Drop
-    # "mqtt" from _COMMAND_PRIORITY if you would rather validate that
-    # path first.
     _POLL_PRIORITY = ("http", "mqtt")
-    _COMMAND_PRIORITY = ("http", "mqtt")
+    _COMMAND_PRIORITY = ("http", "mqtt") if MQTT_MAY_CARRY_COMMANDS else ("http",)
 
     def __init__(self, transports: list[Transport]):
         self._transports = transports
@@ -133,6 +159,28 @@ class TransportRegistry:
             ok = False
         return t, ok
 
+    @staticmethod
+    def _bind_source(
+        t: Transport, on_state_update: StateUpdateCallback,
+    ) -> StateUpdateCallback:
+        """Tie a push callback to the transport that will use it.
+
+        Transports call back with the payload alone, so the coordinator used
+        to attribute a push to the first READY push transport it found. With
+        mqtt READY and listed before websocket, every websocket push was
+        then reported as an mqtt push -- manufacturing precisely the
+        evidence ("last_update_source: mqtt") that the MQTT work is judged
+        on. Binding the name here keeps that report honest and costs one
+        partial per transport.
+        """
+        return functools.partial(on_state_update, source=t.name)
+
+    def state_summary(self) -> str:
+        """One line, "name=state" per transport. Used by the start-up log,
+        the staleness warning and anything else that has to say out loud
+        what the transports are actually doing."""
+        return ", ".join(f"{t.name}={t.state.value}" for t in self._transports)
+
     async def async_start_all(
         self,
         auth: "AuthManager",
@@ -148,7 +196,7 @@ class TransportRegistry:
         for t, ok in results:
             if ok:
                 try:
-                    await t.async_start(auth, on_state_update)
+                    await t.async_start(auth, self._bind_source(t, on_state_update))
                 except Exception as err:
                     _LOGGER.warning("Transport %s failed to start: %s",
                                     t.name, err)
@@ -162,6 +210,11 @@ class TransportRegistry:
                     "Transport %s probe failed; left DISABLED, will be "
                     "retried periodically", t.name,
                 )
+        # Say the outcome out loud, success included. Without this the only
+        # line listing transport states was a staleness WARNING, which a
+        # healthy system never prints: a deploy could be verified only by
+        # the absence of an error, which is not a verification.
+        _LOGGER.info("Transports after start: %s", self.state_summary())
 
     async def async_reprobe_inactive(
         self,
@@ -190,7 +243,7 @@ class TransportRegistry:
             if not ok:
                 continue
             try:
-                await t.async_start(auth, on_state_update)
+                await t.async_start(auth, self._bind_source(t, on_state_update))
             except Exception as err:
                 _LOGGER.warning(
                     "Transport %s answered a re-probe but failed to start: %s",

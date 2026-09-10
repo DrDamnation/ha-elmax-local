@@ -1,7 +1,7 @@
 """Test TransportRegistry routing."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from custom_components.elmax_local.transport import (
     CommandResult, Transport, TransportCapability, TransportRegistry,
@@ -231,3 +231,129 @@ async def test_reprobe_keeps_a_still_broken_transport_disabled(hass):
     assert await reg.async_reprobe_inactive(MagicMock(), AsyncMock()) == []
     assert mqtt.state is TransportState.DISABLED
     assert not mqtt.start_called
+
+
+# --- Push attribution (C2): the coordinator must not guess who pushed ---
+
+async def test_push_callback_carries_the_transport_that_pushed(hass):
+    """Each transport's callback must name that transport, not the first
+    READY push transport in the list.
+
+    With mqtt READY and ordered before websocket, an unbound callback made
+    every websocket push look like an mqtt push -- fabricating exactly the
+    evidence ("last_update_source: mqtt") the mqtt work is judged on.
+    """
+    seen: list[tuple[str, dict]] = []
+
+    async def on_state_update(raw, source="push"):
+        seen.append((source, raw))
+
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.PUSH}))
+    ws = _FakeTransport("websocket", frozenset({TransportCapability.PUSH}))
+    captured: dict[str, object] = {}
+
+    for t in (mqtt, ws):
+        def _make_start(transport):
+            async def _start(auth, cb):
+                captured[transport.name] = cb
+                transport._state = TransportState.READY
+            return _start
+        t.async_start = _make_start(t)
+
+    reg = TransportRegistry([mqtt, ws])
+    await reg.async_start_all(MagicMock(), on_state_update)
+
+    await captured["websocket"]({"from": "ws"})
+    await captured["mqtt"]({"from": "mqtt"})
+
+    assert seen == [("websocket", {"from": "ws"}),
+                    ("mqtt", {"from": "mqtt"})]
+
+
+async def test_reprobe_also_binds_the_transport_identity(hass):
+    """The re-probe start path must bind the source too, or a transport that
+    recovers later goes back to being anonymous."""
+    seen: list[str] = []
+
+    async def on_state_update(raw, source="push"):
+        seen.append(source)
+
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.PUSH}),
+                          probe_ok=False)
+    captured: dict[str, object] = {}
+
+    async def _start(auth, cb):
+        captured["cb"] = cb
+        mqtt._state = TransportState.READY
+
+    mqtt.async_start = _start
+    reg = TransportRegistry([mqtt])
+    await reg.async_start_all(MagicMock(), on_state_update)
+    mqtt._probe_ok = True
+    assert await reg.async_reprobe_inactive(MagicMock(), on_state_update) == ["mqtt"]
+
+    await captured["cb"]({"from": "mqtt"})
+    assert seen == ["mqtt"]
+
+
+# --- Positive signal after start (C3) ---
+
+async def test_start_all_logs_the_resulting_state_of_every_transport(
+        hass, caplog):
+    """Success has to be readable, not deduced from the absence of an error.
+
+    Before this, async_start_all logged only failures and the only line
+    listing transport states was a staleness WARNING that a healthy system
+    never prints -- so a deploy could not be verified from the log at all.
+    """
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}))
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.PUSH}),
+                          probe_ok=False)
+    reg = TransportRegistry([http, mqtt])
+
+    with caplog.at_level("INFO"):
+        await reg.async_start_all(MagicMock(), AsyncMock())
+
+    assert "http=ready" in caplog.text
+    assert "mqtt=disabled" in caplog.text
+    assert reg.state_summary() == "http=ready, mqtt=disabled"
+
+
+# --- D1: MQTT must not carry commands until that path is proven ---
+
+async def test_commands_never_reach_mqtt_while_the_path_is_unproven():
+    """The mqtt COMMAND path has never carried an arm/disarm in production,
+    has no request/response correlation and publishes exactly once: if the
+    confirmation is lost the panel may have EXECUTED while HA reports a
+    failure. Until the user decides otherwise it stays out of the rotation.
+    """
+    http = _FakeTransport("http", frozenset({TransportCapability.COMMAND}),
+                          command_result=CommandResult(ok=False, error="down"))
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.COMMAND}))
+    mqtt.async_send_command = AsyncMock(return_value=CommandResult(ok=True))
+    http._state = TransportState.READY
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    result = await reg.async_send_command("abc-area-0", "1")
+
+    assert result.ok is False
+    mqtt.async_send_command.assert_not_called()
+
+
+async def test_enabling_mqtt_commands_is_a_one_line_change():
+    """The prudent default must be a switch, not a removal."""
+    http = _FakeTransport("http", frozenset({TransportCapability.COMMAND}),
+                          command_result=CommandResult(ok=False, error="down"))
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.COMMAND}))
+    mqtt.async_send_command = AsyncMock(return_value=CommandResult(ok=True))
+    http._state = TransportState.READY
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    with patch.object(TransportRegistry, "_COMMAND_PRIORITY",
+                      ("http", "mqtt")):
+        result = await reg.async_send_command("abc-area-0", "1")
+
+    assert result.ok is True
+    mqtt.async_send_command.assert_called_once()

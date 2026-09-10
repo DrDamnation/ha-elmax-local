@@ -23,6 +23,12 @@ async def async_get_config_entry_diagnostics(
             "name": t.name,
             "state": t.state.value,
             "capabilities": [c.value for c in t.capabilities],
+            # Per-transport facts (mqtt: retained_dropped,
+            # last_fetch_message, subscription confirmation). This dump is
+            # the only channel that reports transport health ON DEMAND --
+            # the log only speaks when something breaks, so a transport
+            # that is READY and silently doing nothing is invisible there.
+            **t.diagnostic_info(),
         }
         for t in coord.registry._transports
     ]

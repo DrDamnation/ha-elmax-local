@@ -12,7 +12,9 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from custom_components.elmax_local.coordinator import (
     ElmaxLocalCoordinator, ElmaxState,
 )
-from custom_components.elmax_local.transport import CommandResult
+from custom_components.elmax_local.transport import (
+    CommandResult, TransportState,
+)
 
 
 def test_state_dataclass_defaults():
@@ -163,3 +165,41 @@ async def test_reprobe_failure_does_not_break_the_poll(hass, mock_panel_data):
             state = await coord._async_update_data()
             await hass.async_block_till_done()
     assert state.zones
+
+
+# --- Push attribution end to end (C2) ---
+
+async def test_websocket_push_is_not_credited_to_mqtt(hass, mock_panel_data):
+    """The diagnostics field the deploy is verified with must tell the truth.
+
+    transports are [http, mqtt, websocket]; get_active_push_transports()
+    returns them in that order, so as soon as the mqtt fix makes mqtt READY,
+    every websocket push was reported as last_update_source='mqtt'. That is
+    the exact evidence someone would use to conclude "MQTT push works".
+    """
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4",
+                                  enable_ws=True, enable_mqtt=True)
+    captured: dict[str, object] = {}
+
+    for transport in coord.registry._transports:
+        def _make(t):
+            async def _probe():
+                return True
+
+            async def _start(auth, cb):
+                captured[t.name] = cb
+                t._state = TransportState.READY
+
+            return _probe, _start
+
+        probe, start = _make(transport)
+        transport.async_probe = probe
+        transport.async_start = start
+
+    await coord.registry.async_start_all(coord.auth, coord._on_push_state_update)
+
+    await captured["websocket"](mock_panel_data)
+    assert coord.data.last_update_source == "websocket"
+
+    await captured["mqtt"](mock_panel_data)
+    assert coord.data.last_update_source == "mqtt"
