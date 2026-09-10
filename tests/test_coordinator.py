@@ -108,3 +108,58 @@ async def test_raises_when_stale_beyond_threshold(hass, mock_panel_data):
     coord = await _stale_coord(hass, mock_panel_data, stale_seconds=60 * 6)
     with pytest.raises(UpdateFailed):
         await coord._async_update_data()
+
+
+# --- Periodic transport re-probe (regression: probe ran only at setup) ---
+
+async def test_update_data_reprobes_inactive_transports(hass, mock_panel_data):
+    """The reconcile tick is what gives a lost transport a second chance."""
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4")
+    with patch.object(coord.registry, "async_fetch_state",
+                      new=AsyncMock(return_value=mock_panel_data)), \
+         patch.object(coord.registry, "async_reprobe_inactive",
+                      new=AsyncMock(return_value=[])) as reprobe:
+        for _ in range(4):
+            await coord._async_update_data()
+            await hass.async_block_till_done()
+    assert reprobe.await_count >= 1
+
+
+async def test_reprobe_is_rate_limited(hass, mock_panel_data):
+    """Backoff: a mute panel must not be hammered every tick."""
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4")
+    with patch.object(coord.registry, "async_fetch_state",
+                      new=AsyncMock(return_value=mock_panel_data)), \
+         patch.object(coord.registry, "async_reprobe_inactive",
+                      new=AsyncMock(return_value=[])) as reprobe:
+        for _ in range(8):
+            await coord._async_update_data()
+            await hass.async_block_till_done()
+    # ticks 2, 4 and 8 only -- never the setup tick, never every tick
+    assert reprobe.await_count == 3
+
+
+async def test_reprobe_runs_even_when_push_is_fresh(hass, mock_panel_data):
+    """A healthy websocket must not keep mqtt excluded for ever."""
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4",
+                                  reconcile_interval=60)
+    await coord._on_push_state_update(mock_panel_data)
+    with patch.object(coord.registry, "async_reprobe_inactive",
+                      new=AsyncMock(return_value=[])) as reprobe:
+        for _ in range(4):
+            await coord._async_update_data()
+            await hass.async_block_till_done()
+    assert reprobe.await_count >= 1
+
+
+async def test_reprobe_failure_does_not_break_the_poll(hass, mock_panel_data):
+    """A raising re-probe must never take the coordinator down with it."""
+    coord = ElmaxLocalCoordinator(hass, "abc", "000000", "1.2.3.4")
+    with patch.object(coord.registry, "async_fetch_state",
+                      new=AsyncMock(return_value=mock_panel_data)), \
+         patch.object(coord.registry, "async_reprobe_inactive",
+                      new=AsyncMock(side_effect=OSError("boom"))):
+        for _ in range(3):
+            state = await coord._async_update_data()
+            await hass.async_block_till_done()
+    assert state.zones

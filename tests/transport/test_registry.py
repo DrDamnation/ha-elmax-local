@@ -20,12 +20,14 @@ class _FakeTransport(Transport):
         self._command_result = command_result or CommandResult(ok=True)
         self.start_called = False
         self.stop_called = False
+        self.probe_count = 0
 
     @property
     def state(self):
         return self._state
 
     async def async_probe(self):
+        self.probe_count += 1
         return self._probe_ok
 
     async def async_start(self, auth, on_push):
@@ -58,15 +60,18 @@ async def test_start_all_probes_and_starts(hass):
     assert http.state == TransportState.READY
 
 
-async def test_unsupported_not_started(hass):
+async def test_unsupported_not_started(hass, caplog):
     http = _FakeTransport("http", frozenset({TransportCapability.POLL}))
     ws = _FakeTransport("ws", frozenset({TransportCapability.PUSH}), probe_ok=False)
     reg = TransportRegistry([http, ws])
     await reg.async_start_all(MagicMock(), AsyncMock())
     assert http.state == TransportState.READY
-    # ws probe returned False, so async_start was not called and state
-    # stays DISABLED. Mark UNSUPPORTED at registry level.
-    assert ws.state in (TransportState.UNSUPPORTED, TransportState.DISABLED)
+    # ws probe returned False, so async_start was not called and the state
+    # stays DISABLED -- which is the truth, and the state the periodic
+    # re-probe looks for. UNSUPPORTED means "never retry" and nothing may
+    # claim it here, in the log message least of all.
+    assert ws.state is TransportState.DISABLED
+    assert "UNSUPPORTED" not in caplog.text
 
 
 async def test_fetch_uses_http_first(hass, mock_panel_data):
@@ -175,3 +180,54 @@ async def test_fetch_survives_transport_exception(hass, mock_panel_data):
     reg = TransportRegistry([http, mqtt])
 
     assert await reg.async_fetch_state() == mock_panel_data
+
+
+# --- Recovery from a failed probe (regression: a failed probe was final) ---
+
+async def test_reprobe_recovers_a_transport_that_failed_at_setup(hass):
+    """A transport that lost its probe at boot must get back in the game.
+
+    The probe has a single call site (coordinator.async_setup), so before
+    this a transport whose broker/panel was not ready at HA start stayed out
+    until the entry was reloaded -- permanently, in practice.
+    """
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}))
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.PUSH,
+                                             TransportCapability.POLL}),
+                          probe_ok=False)
+    reg = TransportRegistry([http, mqtt])
+    await reg.async_start_all(MagicMock(), AsyncMock())
+    assert mqtt.state is TransportState.DISABLED
+    assert not mqtt.start_called
+
+    mqtt._probe_ok = True  # broker finally up / panel reachable
+    recovered = await reg.async_reprobe_inactive(MagicMock(), AsyncMock())
+
+    assert recovered == ["mqtt"]
+    assert mqtt.start_called
+    assert mqtt.state is TransportState.READY
+
+
+async def test_reprobe_leaves_working_transports_alone(hass):
+    """Never re-probe what is already carrying traffic."""
+    http = _FakeTransport("http", frozenset({TransportCapability.POLL}))
+    degraded = _FakeTransport("mqtt", frozenset({TransportCapability.POLL}))
+    reg = TransportRegistry([http, degraded])
+    await reg.async_start_all(MagicMock(), AsyncMock())
+    degraded._state = TransportState.DEGRADED
+    probes_before = (http.probe_count, degraded.probe_count)
+
+    assert await reg.async_reprobe_inactive(MagicMock(), AsyncMock()) == []
+    assert (http.probe_count, degraded.probe_count) == probes_before
+
+
+async def test_reprobe_keeps_a_still_broken_transport_disabled(hass):
+    """A transport that fails again stays out; it must not go DEGRADED."""
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.POLL}),
+                          probe_ok=False)
+    reg = TransportRegistry([mqtt])
+    await reg.async_start_all(MagicMock(), AsyncMock())
+
+    assert await reg.async_reprobe_inactive(MagicMock(), AsyncMock()) == []
+    assert mqtt.state is TransportState.DISABLED
+    assert not mqtt.start_called
