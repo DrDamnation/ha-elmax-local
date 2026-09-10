@@ -342,9 +342,18 @@ async def test_commands_never_reach_mqtt_while_the_path_is_unproven():
 
 
 async def test_enabling_mqtt_commands_is_a_one_line_change():
-    """The prudent default must be a switch, not a removal."""
+    """The prudent default must be a switch, not a removal.
+
+    The HTTP failure here is deliberately one that COULD NOT have executed
+    ("busy" three times over): after P4, a failure that might have run stops
+    the chain instead of being handed on. Testing this with an ambiguous
+    failure would have been testing the double-arm the registry now
+    prevents.
+    """
     http = _FakeTransport("http", frozenset({TransportCapability.COMMAND}),
-                          command_result=CommandResult(ok=False, error="down"))
+                          command_result=CommandResult(
+                              ok=False, error="busy_after_retries",
+                              safe_to_retry=True))
     mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.COMMAND}))
     mqtt.async_send_command = AsyncMock(return_value=CommandResult(ok=True))
     http._state = TransportState.READY
@@ -357,3 +366,77 @@ async def test_enabling_mqtt_commands_is_a_one_line_change():
 
     assert result.ok is True
     mqtt.async_send_command.assert_called_once()
+
+
+# --- P4: failover must not re-send a command that may already have run ---
+
+
+async def test_a_command_that_may_have_run_is_not_sent_to_a_second_transport():
+    """The comment on MQTT_MAY_CARRY_COMMANDS promised that flipping it to
+    True is the whole change. It was not true: async_send_command moved to
+    the next transport on ANY non-ok result, and most command failures are
+    "we did not get a confirmation", not "the panel never got it". An
+    arm/disarm that HTTP timed out on after the panel executed it would
+    have been sent again over MQTT: a double arm/disarm on a lived-in
+    house, from one user action.
+    """
+    http = _FakeTransport(
+        "http", frozenset({TransportCapability.COMMAND}),
+        # aiohttp timed out: the request may well have reached the panel.
+        command_result=CommandResult(ok=False, error="network: timeout"),
+    )
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.COMMAND}))
+    mqtt.async_send_command = AsyncMock(return_value=CommandResult(ok=True))
+    http._state = TransportState.READY
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    with patch.object(TransportRegistry, "_COMMAND_PRIORITY",
+                      ("http", "mqtt")):
+        result = await reg.async_send_command("abc-area-0", "1")
+
+    mqtt.async_send_command.assert_not_called()
+    assert result.ok is False
+    assert result.error == "network: timeout"
+
+
+async def test_a_command_that_certainly_did_not_run_does_fall_over():
+    """The other side: when the transport KNOWS the panel never got it --
+    no token, broker refused the publish, transport not started -- there is
+    nothing to double up, and the fallback is exactly what it is for."""
+    http = _FakeTransport(
+        "http", frozenset({TransportCapability.COMMAND}),
+        command_result=CommandResult(ok=False, error="not_started",
+                                     safe_to_retry=True),
+    )
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.COMMAND}))
+    mqtt.async_send_command = AsyncMock(return_value=CommandResult(ok=True))
+    http._state = TransportState.READY
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    with patch.object(TransportRegistry, "_COMMAND_PRIORITY",
+                      ("http", "mqtt")):
+        result = await reg.async_send_command("abc-area-0", "1")
+
+    mqtt.async_send_command.assert_called_once()
+    assert result.ok is True
+
+
+async def test_a_transport_that_raises_does_not_get_a_second_opinion():
+    """An exception says nothing about whether the panel acted, so it is
+    read the same way as a lost confirmation: stop, report the failure."""
+    http = _FakeTransport("http", frozenset({TransportCapability.COMMAND}))
+    http.async_send_command = AsyncMock(side_effect=RuntimeError("boom"))
+    mqtt = _FakeTransport("mqtt", frozenset({TransportCapability.COMMAND}))
+    mqtt.async_send_command = AsyncMock(return_value=CommandResult(ok=True))
+    http._state = TransportState.READY
+    mqtt._state = TransportState.READY
+    reg = TransportRegistry([http, mqtt])
+
+    with patch.object(TransportRegistry, "_COMMAND_PRIORITY",
+                      ("http", "mqtt")):
+        result = await reg.async_send_command("abc-area-0", "1")
+
+    mqtt.async_send_command.assert_not_called()
+    assert result.ok is False

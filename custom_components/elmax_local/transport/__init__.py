@@ -41,6 +41,14 @@ class CommandResult:
     ok: bool
     error: str | None = None
     raw_response: dict | None = None
+    # Set ONLY when the transport knows the panel never received the
+    # command: nothing was published, no token, the transport was not
+    # started, the panel answered "busy"/"unauthorised". It is what allows
+    # TransportRegistry to hand the command to the next transport without
+    # risking a second arm/disarm. A lost confirmation, a timeout or an
+    # unexpected exception must leave this False: they mean "we do not
+    # know", and on an alarm panel "we do not know" is not a retry.
+    safe_to_retry: bool = False
 
 
 class Transport(ABC):
@@ -306,18 +314,38 @@ class TransportRegistry:
         cmd: str | None,
         code: str | None = None,
     ) -> CommandResult:
+        """Send a command, falling over ONLY when that cannot double it.
+
+        This used to move to the next transport on any non-ok result, which
+        made "flipping MQTT_MAY_CARRY_COMMANDS is a one-line change" false:
+        most command failures are "no confirmation came back", not "the
+        panel never got it". An arm that HTTP timed out on after the panel
+        executed it would have gone out again over MQTT -- one user action,
+        two arm/disarms, on a lived-in house. A transport now has to say
+        safe_to_retry for the command to be repeated anywhere else.
+        """
         last_error = "no_transport"
         for t in self._candidates(self._COMMAND_PRIORITY,
                                   TransportCapability.COMMAND):
             try:
                 result = await t.async_send_command(endpoint_id, cmd, code)
             except Exception as err:
-                _LOGGER.debug("Transport %s command raised: %s", t.name, err)
-                last_error = str(err) or "exception"
-                continue
+                # An exception says nothing about whether the panel acted:
+                # same rule as a lost confirmation, stop here.
+                _LOGGER.warning(
+                    "Transport %s command raised (%s); not retrying "
+                    "elsewhere, the panel may have executed it", t.name, err,
+                )
+                return CommandResult(ok=False, error=str(err) or "exception")
             if result.ok:
                 return result
             last_error = result.error or "unknown"
+            if not result.safe_to_retry:
+                _LOGGER.debug(
+                    "Transport %s failed with %s; not retrying elsewhere, "
+                    "the panel may have executed it", t.name, last_error,
+                )
+                return result
         return CommandResult(ok=False, error=last_error)
 
     def get_active_push_transports(self) -> list[Transport]:

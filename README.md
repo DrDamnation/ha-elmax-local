@@ -167,17 +167,23 @@ report it positively:
 - **The diagnostics dump** (Settings > Devices & Services > Elmax Local >
   ... > Download diagnostics) — the only channel that reports transport
   health *on demand*. Per transport it carries `state`, and for MQTT also:
-  - `last_fetch_message` — which message satisfied the last poll. This is
-    the field that separates "the panel answers our requests" from "the
-    panel publishes on its own and we happened to catch one".
+  - `last_fetch_message` — which message satisfied the last poll. A poll
+    answer is a poll answer: it is never announced as a push, so
+    `last_update_source` cannot be made to read `mqtt` by polling.
   - `retained_dropped` — retained messages ignored (see below). Climbing
     steadily while `state` is `ready` means the channel is delivering
     nothing usable.
+  - `snapshots_refused` / `last_refusal` — messages refused because their
+    content could not be trusted as live (see below). `last_refusal` says
+    why the most recent one was refused.
   - `status_subscription_confirmed` — whether our SUBSCRIBE actually
-    reached the broker.
+    reached the broker. On a Home Assistant old enough to lack
+    `mqtt.async_on_subscribe_done` this falls back to a timed grace period,
+    so there it means "we waited long enough", not "the broker confirmed".
 
   At the top level, `last_update_source` names the transport that pushed
-  the state currently in use.
+  the state currently in use, or `poll` when it came from a reconciliation
+  poll.
 
 ### "Ignoring RETAINED message on /elmax/response/status/..."
 
@@ -194,6 +200,41 @@ broker is bridged to another one, clear it on the remote broker first.** A
 bridge configured with `topic # both` re-imports the retained message as
 soon as it reconnects, so cleaning only the local broker appears to work
 and then silently undoes itself.
+
+### "Refusing a message on /elmax/response/status/..."
+
+The retain flag alone is not a usable guard against a replayed snapshot.
+When a bridge re-imports a retained message, the MQTT specification
+(MQTT-3.3.1-9) says it is delivered to clients that are **already
+subscribed** with the retain flag **cleared** — so an old snapshot arrives
+looking exactly like a live update. On an alarm panel that would show every
+area disarmed while the system is armed, and it would mark the data fresh,
+silencing the staleness watchdog that should have caught it.
+
+So the integration checks the *content* of every status message and refuses
+it unless all three hold:
+
+- the payload's `centrale` matches the configured panel (a mismatch is
+  refused; a payload that simply omits the field is not);
+- its `datetime` — the panel's own clock, `HH:MM:SS DD/MM/YYYY` — is
+  present, parsable, and within **six hours** of Home Assistant's clock.
+  The panel's clock is not synchronised with Home Assistant's, so the
+  window is deliberately loose in both directions: ordinary drift must
+  never cost a real update, while any replay worth fearing is far older
+  than that. A payload with no usable timestamp is refused, on purpose:
+  without one there is no way to tell a live update from a replay;
+- it is not older than the last snapshot already accepted. One known
+  consequence, accepted deliberately: at the autumn daylight-saving change
+  the panel's local clock repeats an hour, so MQTT status is refused for up
+  to that hour. HTTP polling carries on throughout and the channel heals
+  itself.
+
+Refusing costs a poll — HTTP is tried first anyway. Accepting a replay puts
+a false state on an alarm panel, so the trade is made in that direction.
+`snapshots_refused` and `last_refusal` in the diagnostics count and explain
+the refusals; the warning repeats at most every 10 minutes. If it repeats
+while the panel is healthy, compare the panel's clock with Home
+Assistant's.
 
 ## Compatibility
 
