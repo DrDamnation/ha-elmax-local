@@ -1,8 +1,11 @@
 """MQTT transport for Elmax Local.
 
 Uses HA's mqtt integration. Sub to /elmax/response/status/{panel_id}
-delivers BOTH responses to requests AND spontaneous push updates
-(distinguished by 'message' field). Both are forwarded to on_state_update.
+delivers BOTH the replies to our own requests AND spontaneous push updates.
+The 'message' field does not tell them apart -- nothing here gates on it --
+so the only distinction available is whether a call of ours is waiting for
+an answer at that instant: if one is, the message satisfies that poll; if
+none is, it is a push and goes to on_state_update.
 
 Delivery is not free here. `mqtt.async_subscribe` does NOT put a SUBSCRIBE
 on the wire: it registers the callback in memory and schedules a debounced
@@ -85,28 +88,29 @@ RETAINED_WARN_INTERVAL = 600
 #
 # So the guard is on the CONTENT. Every status payload carries the panel's
 # own clock as "HH:MM:SS DD/MM/YYYY"; a snapshot is accepted only if that
-# stamp is close to our own clock AND not older than the last one accepted.
+# stamp is close to our own clock and the payload actually describes this
+# panel.
 PANEL_DATETIME_FORMAT = "%H:%M:%S %d/%m/%Y"
 
-# How far the panel's clock may sit from Home Assistant's before a payload
-# stops counting as live. Deliberately loose, in BOTH directions: the panel
-# is not synchronised with HA (no NTP client of ours, its own RTC, a
-# timezone we do not set) so a couple of hours of drift is ordinary and must
-# never cost a real update. Nothing plausible drifts by six hours, and the
-# replay this defends against is months old, so the window has room to
-# spare on the side that matters. Refusing costs a poll -- HTTP is tried
-# first anyway; accepting a replay puts a false state on an alarm panel.
-STATUS_MAX_CLOCK_SKEW = 6 * 3600
-
-# For how long after publishing a request an incoming status counts as the
-# ANSWER to that request rather than as a spontaneous push. There is no
-# correlation id in this protocol, so this window is the whole of the
-# correlation available; it starts at each publish, never before. It is
-# sized to the full request budget plus slack rather than to one reply
-# wait, because an answer that arrives after we gave up is still an answer:
-# crediting it to the push channel would be the same false claim ("MQTT
-# push works") from the other direction. See _is_answering_us.
-REQUEST_ANSWER_WINDOW = STATUS_TIMEOUT + 2
+# How old a snapshot may be, by its own clock, and still count as live.
+#
+# MEASURED on 2026-09-10, read-only, from the Home Assistant host: a GET on
+# the panel's /api/v2/discovery answered stamped "18:58:09 10/09/2026"
+# against a Home Assistant wall clock reading "18:58:09 10/09/2026" -- 0.9s
+# apart, round trip included, and in LOCAL time. This panel does not drift
+# by hours. The previous six-hour window was sized for a drift nobody had
+# measured, and what it actually granted was a six-hour amnesty to replays.
+#
+# Five minutes is three hundred times the error observed. When it is wrong,
+# an MQTT status is refused, counted in the diagnostics with its reason,
+# and the poll falls back to HTTP -- the primary channel, and first in
+# _POLL_PRIORITY anyway. What it buys: a snapshot the bridge re-imports
+# cannot pass for current unless the panel published it in the last five
+# minutes. There is no monotonic floor beside it any more: a floor could
+# not see a re-import (which carries the SAME stamp as the message it
+# copies), it was fed only by MQTT while the state normally comes over
+# HTTP, and it started empty after every restart, reload and re-probe.
+STATUS_MAX_AGE = 300
 
 
 def _local_now() -> datetime:
@@ -156,16 +160,14 @@ class MqttTransport(Transport):
         self._retained_dropped = 0
         self._retained_warned_at: float | None = None
         self._last_fetch_message: str | None = None
-        # Newest panel timestamp accepted so far: the monotonic floor that
-        # a replayed snapshot cannot get under.
-        self._last_status_dt: datetime | None = None
         self._snapshots_refused = 0
         self._last_refusal: str | None = None
         self._refusal_warned_at: float | None = None
-        # monotonic() deadlines: while one of these is in the future we are
-        # waiting for an answer to a request WE published.
-        self._status_answer_until = 0.0
-        self._command_answer_until = 0.0
+        # True only while a call of ours is actually waiting for the answer
+        # to a request it has already published. This is the whole of the
+        # correlation the protocol allows -- there is no request id.
+        self._status_waiting = False
+        self._command_waiting = False
 
     @property
     def state(self) -> TransportState:
@@ -410,24 +412,42 @@ class MqttTransport(Transport):
             _LOGGER.warning("Invalid MQTT status payload")
             return
 
-        answering_us = self._is_answering_us(self._status_answer_until)
+        # Provenance FIRST, before any branch acts on this payload. The
+        # 401 branch used to run ahead of it, so a reply carrying another
+        # panel's name could still throw our token away.
+        if not self._belongs_to_us(data, msg):
+            return
+
+        answering_us = self._status_waiting
 
         message = data.get("message", "")
         if "401" in message:
+            if not answering_us:
+                # This response topic is shared by every client of this
+                # panel and mirrored by the NAS bridge: somebody else's
+                # expired token says nothing about ours, and acting on it
+                # would drop a working JWT and force a needless re-login.
+                _LOGGER.debug("Ignoring an unsolicited 401 on %s",
+                              getattr(msg, "topic", "?"))
+                return
             if self._auth:
                 self._hass.async_create_task(self._auth.async_handle_401())
             # Wake the waiter: the panel has already said no. Returning
             # silently left async_fetch_state sitting out its whole window
             # and then blaming a timeout, hiding an auth problem behind a
-            # connectivity one. Only if we actually asked, though -- an
-            # unsolicited 401 answers no request of ours.
-            if answering_us:
-                self._status_response = data
-                self._status_event.set()
+            # connectivity one.
+            self._status_response = data
+            self._status_event.set()
             return
 
         status = self._accept_status(data, msg)
         if status is None:
+            if answering_us:
+                # The panel DID answer and the answer was unusable. Say so
+                # now: leaving the poll to time out made it report a mute
+                # panel, which is a different fault with a different fix.
+                self._status_response = None
+                self._status_event.set()
             return
 
         if answering_us:
@@ -452,48 +472,54 @@ class MqttTransport(Transport):
             # unload, so nothing pruned it in production.
             task.add_done_callback(self._pending_tasks.discard)
 
-    @staticmethod
-    def _is_answering_us(deadline: float) -> bool:
-        """True while an answer to a request we published is still due.
+    def _belongs_to_us(self, data: dict, msg) -> bool:
+        """False if the payload names a panel that is not ours.
 
-        This protocol carries no request id, so there is nothing to match a
-        reply against: the only correlation available is "did we ask, and
-        was it just now". The window opens at the publish (never before it,
-        which is what stops a message that PREDATES the request from
-        satisfying it) and closes REQUEST_ANSWER_WINDOW later. Two things
-        stay outside what it can distinguish, and both are documented rather
-        than papered over: a spontaneous push landing inside the window is
-        read as our answer, and an answer arriving after the window has
-        closed is read as a push. Narrowing it further would start losing
-        real answers; the honest fix is a correlation id the panel does not
-        offer.
+        The topic is already panel-scoped, but the broker is bridged to
+        another one that mirrors every topic, so check the payload too --
+        the same check the probe does on /elmax/response/id. Deliberately
+        asymmetric: a MISMATCH is refused, an ABSENCE is not.
+        coordinator._parse already defaults this field to the configured
+        panel id and no panel has ever been observed to omit it; refusing on
+        absence would be a guess about a format we have not measured, with
+        the whole channel as the stake.
         """
-        return time.monotonic() < deadline
+        centrale = data.get("centrale")
+        status = data.get("status")
+        if isinstance(status, dict):
+            centrale = status.get("centrale", centrale)
+        if centrale is not None and str(centrale) != self._panel_id:
+            self._refuse(msg, f"belongs to panel {centrale}")
+            return False
+        return True
 
     def _accept_status(self, data: dict, msg) -> dict | None:
         """Return the status payload only if it can be trusted as LIVE.
 
-        See STATUS_MAX_CLOCK_SKEW above for why the retain flag is not
-        enough. Every rejection is counted and surfaced in the diagnostics,
-        because a guard that silently refuses everything looks exactly like
-        a channel that works and has nothing to say.
+        See STATUS_MAX_AGE above for why the retain flag is not enough.
+        Every rejection is counted and surfaced in the diagnostics, because
+        a guard that silently refuses everything looks exactly like a
+        channel that works and has nothing to say.
         """
         status = data.get("status")
         if not isinstance(status, dict) or not status:
             self._refuse(msg, "no status payload")
             return None
 
-        # The state topic is already panel-scoped, but the broker is bridged
-        # to another one that mirrors every topic, so check the payload too
-        # -- the same check the probe does on /elmax/response/id.
-        # Deliberately asymmetric: a MISMATCH is refused, an ABSENCE is not.
-        # coordinator._parse already defaults this field to the configured
-        # panel id and no panel has ever been observed to omit it; refusing
-        # on absence would be a guess about a format we have not measured,
-        # with the whole channel as the stake.
-        centrale = status.get("centrale", data.get("centrale"))
-        if centrale is not None and str(centrale) != self._panel_id:
-            self._refuse(msg, f"belongs to panel {centrale}")
+        # This payload does not update the state, it REPLACES it: the
+        # coordinator rebuilds every index from it and each entity whose
+        # endpointId is no longer there goes unavailable, with the poll that
+        # would repair them suppressed while the push still counts as fresh.
+        # So require the four lists the coordinator reads, and require the
+        # two that carry the alarm to be populated -- the live panel answers
+        # with 5 areas and 39 zones, and a status missing either of them is
+        # not a description of this panel.
+        for key in ("aree", "zone", "uscite", "scenari"):
+            if not isinstance(status.get(key), list):
+                self._refuse(msg, f"no '{key}' list in the status payload")
+                return None
+        if not status["aree"] or not status["zone"]:
+            self._refuse(msg, "status carries no areas or no zones")
             return None
 
         stamp = status.get("datetime")
@@ -506,29 +532,16 @@ class MqttTransport(Transport):
             self._refuse(msg, f"no usable timestamp ({stamp!r})")
             return None
 
-        skew = (_local_now() - panel_dt).total_seconds()
-        if abs(skew) > STATUS_MAX_CLOCK_SKEW:
+        age = (_local_now() - panel_dt).total_seconds()
+        if abs(age) > STATUS_MAX_AGE:
+            # Symmetric on purpose. A stamp in the future is not a replay,
+            # but it is not proof of liveness either: the only thing that
+            # produces one is a clock we cannot use to date this payload.
             self._refuse(
-                msg, f"stamped {stamp}, {int(skew)}s away from our clock",
+                msg, f"stamped {stamp}, {int(age)}s from our clock",
             )
             return None
 
-        if self._last_status_dt is not None and panel_dt < self._last_status_dt:
-            # A replay does not have to be months old to hurt: any snapshot
-            # older than the one we are already showing walks the areas
-            # backwards. Known consequence, accepted: at the autumn DST
-            # change the panel's local clock repeats an hour, so MQTT status
-            # is refused for up to that hour while HTTP polling carries on.
-            # Refusing a real update for an hour is the safe direction, and
-            # it heals itself.
-            self._refuse(
-                msg,
-                f"stamped {stamp}, older than the last accepted "
-                f"({self._last_status_dt.strftime(PANEL_DATETIME_FORMAT)})",
-            )
-            return None
-
-        self._last_status_dt = panel_dt
         return status
 
     def _refuse(self, msg, reason: str) -> None:
@@ -603,7 +616,7 @@ class MqttTransport(Transport):
         if centrale is not None and str(centrale) != self._panel_id:
             self._refuse(msg, f"command reply belongs to panel {centrale}")
             return
-        if not self._is_answering_us(self._command_answer_until):
+        if not self._command_waiting:
             # Nobody here published a command, so this confirms nothing of
             # ours. The bridge mirrors this topic from another broker.
             _LOGGER.debug(
@@ -655,17 +668,15 @@ class MqttTransport(Transport):
                     # request. Clearing it once at the top of the function
                     # left the whole subscription wait open: anything that
                     # landed in there satisfied a request not yet sent, and
-                    # the answer window (which is all the correlation this
-                    # protocol allows) must not start before the request.
+                    # "we are waiting for an answer" -- all the correlation
+                    # this protocol allows -- must not start before it.
                     self._status_response = None
                     self._status_event.clear()
-                    self._status_answer_until = (
-                        time.monotonic() + REQUEST_ANSWER_WINDOW
-                    )
+                    self._status_waiting = True
                     try:
                         await mqtt.async_publish(self._hass, topic, payload)
                     except HomeAssistantError as err:
-                        self._status_answer_until = 0.0
+                        self._status_waiting = False
                         _LOGGER.debug(
                             "mqtt fetch: broker refused the request (%s), "
                             "retrying", err,
@@ -687,8 +698,25 @@ class MqttTransport(Transport):
             )
             self._state = TransportState.DEGRADED
             return None
+        finally:
+            # Closed the instant we stop waiting, on every path out. Left
+            # open -- which is what a deadline armed at the publish did --
+            # the next spontaneous push was filed as "our answer" into a
+            # latch nobody reads any more, and never reached the
+            # coordinator at all. Mislabelling a push is a wrong word in
+            # the diagnostics; swallowing one is a wrong alarm state.
+            self._status_waiting = False
 
-        data = self._status_response or {}
+        data = self._status_response
+        if data is None:
+            # The panel answered and _accept_status refused the answer;
+            # it woke us so this poll would not sit out its whole budget
+            # and then report a panel that never replied. Do not ask
+            # again: the next copy would be the same message.
+            _LOGGER.debug("mqtt fetch: the panel's answer was refused (%s)",
+                          self._last_refusal)
+            self._state = TransportState.DEGRADED
+            return None
         message = data.get("message", "")
         # Record WHICH message satisfied the poll; deliberately do NOT gate
         # on it. "the panel answers OUR requests" vs "the panel publishes on
@@ -753,7 +781,7 @@ class MqttTransport(Transport):
         # command that had not been sent yet.
         self._command_response = None
         self._command_event.clear()
-        self._command_answer_until = time.monotonic() + REQUEST_ANSWER_WINDOW
+        self._command_waiting = True
         try:
             await mqtt.async_publish(
                 self._hass,
@@ -762,7 +790,7 @@ class MqttTransport(Transport):
             )
         except HomeAssistantError as err:
             # Nothing left the box: a clean failure, the panel did nothing.
-            self._command_answer_until = 0.0
+            self._command_waiting = False
             self._state = TransportState.DEGRADED
             return CommandResult(ok=False, error=f"broker: {err}",
                                  safe_to_retry=True)
@@ -773,6 +801,10 @@ class MqttTransport(Transport):
             # nothing about whether the panel ran it, so this must never be
             # handed to another transport to try again.
             return CommandResult(ok=False, error="timeout")
+        finally:
+            # Same rule as the status path: we are only "expecting an
+            # answer" while we are actually waiting for one.
+            self._command_waiting = False
         if self._command_response:
             msg = self._command_response.get("message", "")
             if "200" in msg:

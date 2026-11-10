@@ -62,10 +62,22 @@ def panel_stamp(offset: timedelta = timedelta(0)) -> str:
     return (dt_util.now().replace(tzinfo=None) + offset).strftime(PANEL_DT_FMT)
 
 
+# Shaped like the payload read from the LIVE panel on 2026-09-10 (GET
+# /api/v2/discovery from the Home Assistant host: 39 zones, 5 areas, 14
+# outputs, 9 scenarios). A status payload replaces the WHOLE coordinator
+# state, so one that carries no areas and no zones would take every alarm
+# entity unavailable; 'uscite' and 'scenari' are left empty on purpose, to
+# pin that they are NOT required to be populated.
 PANEL_STATUS_BASE = {
     "centrale": PANEL_ID,
     "release": "PHANTOM64PRO_GSM 13.9L.844",
-    "zone": [], "aree": [], "uscite": [], "scenari": [],
+    "zone": [{"endpointId": f"{PANEL_ID}-zona-0", "indice": 0,
+              "visibile": True, "aperta": False, "esclusa": False,
+              "nome": "ZONA 01"}],
+    "aree": [{"endpointId": f"{PANEL_ID}-area-0", "indice": 0,
+              "visibile": True, "stato": 0, "statoSessione": 1,
+              "statiDisponibili": [0, 1, 2, 3, 4], "nome": "AREA 1"}],
+    "uscite": [], "scenari": [],
 }
 
 STATUS_401_REPLY = json.dumps({"message": "401 Unauthorized"})
@@ -811,11 +823,18 @@ async def test_a_reimported_snapshot_cannot_satisfy_a_poll_either(
     assert mqtt_transport.state is TransportState.DEGRADED
 
 
-async def test_a_snapshot_older_than_the_last_accepted_one_is_refused(
+async def test_the_same_current_snapshot_twice_is_not_refused(
         hass, mqtt_transport, auth, panel_status):
-    """Monotonicity. A re-import does not have to be months old to hurt:
-    a snapshot from ten minutes ago is inside any sane freshness window and
-    would still walk the areas backwards."""
+    """The monotonic floor is GONE, deliberately (R1).
+
+    It never closed the case it was written for: a re-import carries the
+    same stamp as the last message accepted, and the comparison was strict.
+    It was fed only by MQTT while the primary channel is HTTP, and it
+    started empty after every restart, reload and re-probe. What is left is
+    the age rule, which does not care how many times the panel says the
+    same thing -- only how old what it says is. A duplicate of a CURRENT
+    snapshot carries current state: repeating it costs one redundant
+    coordinator update."""
     pushes = []
 
     async def on_push(data):
@@ -824,25 +843,16 @@ async def test_a_snapshot_older_than_the_last_accepted_one_is_refused(
     with patch.object(mqtt_transport, "_subscribe_responses", new=AsyncMock()):
         await mqtt_transport.async_start(auth, on_push)
 
-    live = MagicMock(retain=False)
-    live.topic = STATUS_RESP_TOPIC
-    live.payload = json.dumps({"message": "200 Status Update",
-                               "status": panel_status})
-    mqtt_transport._handle_status_message(live)
-    await mqtt_transport._drain_pending()
-    assert len(pushes) == 1
-
-    older = MagicMock(retain=False)
-    older.topic = STATUS_RESP_TOPIC
-    older.payload = json.dumps({
-        "message": "200 Status Update",
-        "status": dict(panel_status,
-                       datetime=panel_stamp(timedelta(minutes=-10))),
-    })
-    mqtt_transport._handle_status_message(older)
+    for _ in range(2):
+        msg = MagicMock(retain=False)
+        msg.topic = STATUS_RESP_TOPIC
+        msg.payload = json.dumps({"message": "200 Status Update",
+                                  "status": panel_status})
+        mqtt_transport._handle_status_message(msg)
     await mqtt_transport._drain_pending()
 
-    assert len(pushes) == 1, "state went backwards in time"
+    assert pushes == [panel_status, panel_status]
+    assert mqtt_transport.diagnostic_info()["snapshots_refused"] == 0
 
 
 async def test_a_status_from_another_panel_is_refused(
@@ -915,16 +925,19 @@ async def test_a_status_without_a_usable_timestamp_is_refused(
 
 async def test_a_drifting_panel_clock_is_tolerated(
         hass, mqtt_transport, auth, panel_status):
-    """The panel's clock is not synchronised with Home Assistant's. The
-    freshness rule has to be loose enough that ordinary drift -- hours, in
-    either direction -- never costs a live update, or the guard would take
-    the channel down instead of protecting it."""
+    """Ordinary drift must never cost a live update.
+
+    How much is "ordinary" was MEASURED on 2026-09-10 instead of guessed:
+    the panel's own 'datetime' came back 0.9s from Home Assistant's wall
+    clock, round trip included, and in LOCAL time (see the R1 section at
+    the bottom of this file). Two minutes either way is two orders of
+    magnitude more than that and still far inside STATUS_MAX_AGE."""
     pushes = []
 
     async def on_push(data):
         pushes.append(data)
 
-    for drift in (timedelta(hours=-2), timedelta(hours=2)):
+    for drift in (timedelta(minutes=-2), timedelta(minutes=2)):
         transport = MqttTransport(hass, PANEL_ID)
         transport._auth = auth
         transport._on_push = on_push
@@ -1163,3 +1176,182 @@ async def test_a_second_poll_does_not_reuse_the_first_answer_latch(
     assert await mqtt_transport.async_fetch_state() == panel_status
     assert mqtt_transport.state is TransportState.READY
     assert len(instant_panel.status_requests) == 2
+
+
+# --- Round 4: closing what the content guard left open ------------------
+#
+# The panel's clock was MEASURED on 2026-09-10, read-only, from the Home
+# Assistant host itself: GET /api/v2/discovery answered with datetime
+# '18:58:09 10/09/2026' against a Home Assistant wall clock reading
+# '18:58:09 10/09/2026' -- 0.9s apart, round trip included, in LOCAL time.
+# The "hours of ordinary drift" the six-hour window was sized for do not
+# exist on this installation, so the freshness rule can be what it should
+# always have been: the AGE of the snapshot.
+
+
+async def test_a_snapshot_from_half_an_hour_ago_is_refused(
+        hass, mqtt_transport, auth, panel_status):
+    """R1. Nothing has been accepted yet -- which is the state of every
+    transport after a restart, a reload or a re-probe, and exactly where
+    the monotonic floor was empty and the six-hour window was the only
+    guard left standing. A snapshot stamped half an hour ago is not this
+    panel talking now; on an inhabited house it is five areas reading
+    'Disarmed' while the alarm is armed."""
+    pushes = []
+
+    async def on_push(data):
+        pushes.append(data)
+
+    with patch.object(mqtt_transport, "_subscribe_responses", new=AsyncMock()):
+        await mqtt_transport.async_start(auth, on_push)
+
+    msg = MagicMock(retain=False)
+    msg.topic = STATUS_RESP_TOPIC
+    msg.payload = json.dumps({
+        "message": "200 Status Update",
+        "status": dict(panel_status,
+                       datetime=panel_stamp(timedelta(minutes=-30))),
+    })
+    mqtt_transport._handle_status_message(msg)
+    await mqtt_transport._drain_pending()
+
+    assert pushes == [], "a half-hour-old snapshot became the alarm state"
+    assert mqtt_transport.diagnostic_info()["snapshots_refused"] == 1
+
+
+async def test_a_push_that_lands_after_a_poll_is_not_swallowed(
+        hass, mqtt_transport, auth, instant_panel, panel_status):
+    """R2. The answer window opened at the publish and was never closed:
+    for ten seconds after every MQTT poll a real spontaneous update was
+    filed as 'our answer', written into a latch nobody was waiting on any
+    more, and lost. Before this branch that message reached the
+    coordinator. A push read as a poll is a wrong label; a push dropped in
+    silence is a wrong alarm state."""
+    pushes = []
+
+    async def on_push(data):
+        pushes.append(data)
+
+    with patch.object(mqtt_transport, "_subscribe_responses", new=AsyncMock()):
+        await mqtt_transport.async_start(auth, on_push)
+
+    assert await mqtt_transport.async_fetch_state() == panel_status
+    assert pushes == [], "the answer to our own poll was reported as a push"
+
+    spontaneous = dict(panel_status, datetime=panel_stamp())
+    msg = MagicMock(retain=False)
+    msg.topic = STATUS_RESP_TOPIC
+    msg.payload = json.dumps({"message": "200 Status Update",
+                              "status": spontaneous})
+    mqtt_transport._handle_status_message(msg)
+    await mqtt_transport._drain_pending()
+
+    assert pushes == [spontaneous], (
+        "a spontaneous update landing after the poll never reached the "
+        "coordinator"
+    )
+
+
+async def test_an_unsolicited_401_does_not_drop_our_token(
+        hass, mqtt_transport, auth):
+    """R4. The 401 branch ran before every other check. This response topic
+    is shared by every client of this panel and mirrored by the NAS bridge,
+    so somebody else's expired token produced a 401 on it -- and this
+    transport threw away a perfectly good JWT and forced a re-login. Only a
+    401 answering a request WE published says anything about OUR token."""
+    with patch.object(mqtt_transport, "_subscribe_responses", new=AsyncMock()):
+        await mqtt_transport.async_start(auth, AsyncMock())
+
+    msg = MagicMock(retain=False)
+    msg.topic = STATUS_RESP_TOPIC
+    msg.payload = STATUS_401_REPLY
+
+    with patch.object(auth, "async_handle_401", new=AsyncMock()) as handled:
+        mqtt_transport._handle_status_message(msg)
+        await hass.async_block_till_done()
+
+    handled.assert_not_awaited()
+
+
+async def test_a_401_stamped_with_another_panel_is_ignored(
+        hass, mqtt_transport, auth):
+    """R4, the provenance half: the 401 branch also ran before the
+    'centrale' check, so a reply belonging to another panel could drop our
+    token. Absence of 'centrale' stays tolerated (that decision is
+    unchanged); a MISMATCH is refused, on this branch too."""
+    with patch.object(mqtt_transport, "_subscribe_responses", new=AsyncMock()):
+        await mqtt_transport.async_start(auth, AsyncMock())
+
+    msg = MagicMock(retain=False)
+    msg.topic = STATUS_RESP_TOPIC
+    msg.payload = json.dumps({"message": "401 Unauthorized",
+                              "centrale": "0000000000000000000"})
+
+    mqtt_transport._status_waiting = True  # we ARE waiting for an answer
+    with patch.object(auth, "async_handle_401", new=AsyncMock()) as handled:
+        mqtt_transport._handle_status_message(msg)
+        await hass.async_block_till_done()
+
+    handled.assert_not_awaited()
+    assert not mqtt_transport._status_event.is_set()
+
+
+async def test_a_refused_answer_is_not_reported_as_a_mute_panel(
+        hass, mqtt_transport, auth, instant_panel):
+    """R5. The panel answered and the answer was refused -- and the poll
+    sat out its whole budget and then blamed the panel for silence, in the
+    log line an operator reads to decide whether the channel works. Wake
+    the waiter: the answer arrived, it was just not usable."""
+    instant_panel.status_reply = MAY_SNAPSHOT_REPLY
+    await _start_offline(mqtt_transport, auth)
+
+    with patch.object(mqtt_module, "STATUS_TIMEOUT", 5), \
+         patch.object(mqtt_module, "STATUS_REPLY_WAIT", 3):
+        started = time.monotonic()
+        result = await mqtt_transport.async_fetch_state()
+        elapsed = time.monotonic() - started
+
+    assert result is None
+    assert mqtt_transport.state is TransportState.DEGRADED
+    assert elapsed < 1.5, (
+        f"waited {elapsed:.1f}s after an answer had already been refused"
+    )
+    assert len(instant_panel.status_requests) == 1, (
+        "kept re-asking a panel that had already answered"
+    )
+    assert mqtt_transport.diagnostic_info()["last_refusal"]
+
+
+async def test_a_status_that_does_not_describe_the_panel_is_refused(
+        hass, mqtt_transport, auth, panel_status):
+    """R6. A status payload replaces the WHOLE state: coordinator._parse
+    rebuilds every index from it, and every entity whose endpointId is no
+    longer there goes unavailable -- with the reconciliation poll that
+    would repair them suppressed for up to 90s, because the push had just
+    been marked fresh. Demand the keys the coordinator actually reads, and
+    demand that the two that carry the alarm are not empty."""
+    pushes = []
+
+    async def on_push(data):
+        pushes.append(data)
+
+    with patch.object(mqtt_transport, "_subscribe_responses", new=AsyncMock()):
+        await mqtt_transport.async_start(auth, on_push)
+
+    no_areas = dict(panel_status, aree=[])
+    no_zones = dict(panel_status)
+    no_zones.pop("zone")
+    no_outputs_key = dict(panel_status)
+    no_outputs_key.pop("uscite")
+    not_a_list = dict(panel_status, aree={})
+
+    for status in (no_areas, no_zones, no_outputs_key, not_a_list):
+        msg = MagicMock(retain=False)
+        msg.topic = STATUS_RESP_TOPIC
+        msg.payload = json.dumps({"message": "200 Status Update",
+                                  "status": status})
+        mqtt_transport._handle_status_message(msg)
+    await mqtt_transport._drain_pending()
+
+    assert pushes == [], "a status that is not this panel became its state"
+    assert mqtt_transport.diagnostic_info()["snapshots_refused"] == 4

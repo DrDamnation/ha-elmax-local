@@ -120,12 +120,20 @@ class HttpTransport(Transport):
                     # Any other status: the panel answered, but nothing says
                     # whether it acted first. Do not let it be sent twice.
                     return CommandResult(ok=False, error=f"http_{resp.status}")
-            except aiohttp.ClientConnectionError as err:
-                # Never got a connection: the request did not reach the panel.
+            except aiohttp.ClientConnectorError as err:
+                # The CONNECTION ATTEMPT itself failed (refused, unroutable,
+                # DNS, TLS): nothing was ever sent, so the panel did not act
+                # and another transport may safely try. Deliberately NOT the
+                # wider ClientConnectionError: ServerDisconnectedError is a
+                # subclass of it (checked on aiohttp 3.11.9 here and 3.14.3
+                # in the live container), and that one means the connection
+                # WAS established and then lost -- the request may already
+                # have armed or disarmed the house.
                 return CommandResult(ok=False, error=f"network: {err}",
                                      safe_to_retry=True)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                # Connected, then lost it (or timed out): unknowable.
+                # Connected, then lost it (or timed out): unknowable, so it
+                # must not be sent again on another transport.
                 return CommandResult(ok=False, error=f"network: {err}")
         # Three 422s in a row: the panel said "busy" every time, and busy
         # means it did not take the command.

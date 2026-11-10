@@ -215,26 +215,37 @@ So the integration checks the *content* of every status message and refuses
 it unless all three hold:
 
 - the payload's `centrale` matches the configured panel (a mismatch is
-  refused; a payload that simply omits the field is not);
+  refused; a payload that simply omits the field is not). This is checked
+  before anything else acts on the message, a `401` included — the response
+  topic is shared by every client of the panel and mirrored by the bridge;
+- it carries the four lists the coordinator reads (`aree`, `zone`,
+  `uscite`, `scenari`), and the two that carry the alarm — `aree` and
+  `zone` — are not empty. A status payload does not update the state, it
+  *replaces* it: a partial one would take every entity unavailable and
+  suppress the poll that would repair them;
 - its `datetime` — the panel's own clock, `HH:MM:SS DD/MM/YYYY` — is
-  present, parsable, and within **six hours** of Home Assistant's clock.
-  The panel's clock is not synchronised with Home Assistant's, so the
-  window is deliberately loose in both directions: ordinary drift must
-  never cost a real update, while any replay worth fearing is far older
-  than that. A payload with no usable timestamp is refused, on purpose:
-  without one there is no way to tell a live update from a replay;
-- it is not older than the last snapshot already accepted. One known
-  consequence, accepted deliberately: at the autumn daylight-saving change
-  the panel's local clock repeats an hour, so MQTT status is refused for up
-  to that hour. HTTP polling carries on throughout and the channel heals
-  itself.
+  present, parsable, and **within five minutes** of Home Assistant's clock.
+  Measured on 2026-09-10 against the live panel, the two clocks were 0.9s
+  apart with the round trip included, so five minutes is three hundred
+  times the drift actually observed. A payload with no usable timestamp is
+  refused, on purpose: without one there is no way to tell a live update
+  from a replay.
+
+There is deliberately **no** "newer than the last one accepted" rule. A
+re-imported message carries the *same* timestamp as the copy it replays, so
+such a rule cannot see the case it was written for; it was fed only by MQTT
+while the state normally arrives over HTTP, and it started empty after every
+restart, reload and re-probe. The age of the snapshot is the check that
+means something.
 
 Refusing costs a poll — HTTP is tried first anyway. Accepting a replay puts
-a false state on an alarm panel, so the trade is made in that direction.
-`snapshots_refused` and `last_refusal` in the diagnostics count and explain
-the refusals; the warning repeats at most every 10 minutes. If it repeats
-while the panel is healthy, compare the panel's clock with Home
-Assistant's.
+a false state on an alarm panel, so the trade is made in that direction. A
+refused answer no longer costs the whole request budget either: the poll is
+woken as soon as the message is refused, instead of waiting out its timeout
+and reporting a panel that never replied. `snapshots_refused` and
+`last_refusal` in the diagnostics count and explain the refusals; the
+warning repeats at most every 10 minutes. If it repeats while the panel is
+healthy, compare the panel's clock with Home Assistant's.
 
 ## Compatibility
 

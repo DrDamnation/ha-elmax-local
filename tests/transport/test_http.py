@@ -1,8 +1,10 @@
 """Test HttpTransport."""
 from __future__ import annotations
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
+from unittest.mock import MagicMock
 
 from custom_components.elmax_local.auth import AuthManager
 from custom_components.elmax_local.transport import (
@@ -104,3 +106,51 @@ async def test_send_command_503_fails(http_transport, auth):
         result = await http_transport.async_send_command("eid", "1")
         assert result.ok is False
         assert "503" in (result.error or "")
+
+
+# --- R3: "safe_to_retry" must mean the panel provably did not act -------
+#
+# aiohttp.ServerDisconnectedError is a SUBCLASS of ClientConnectionError
+# (verified on both the test venv, aiohttp 3.11.9, and the live container,
+# aiohttp 3.14.3), so the branch meant for "we never got a connection" was
+# also catching "we had a connection and lost it mid-request". On an
+# arm/disarm that is the double send this flag exists to prevent.
+
+
+async def test_a_server_disconnect_mid_command_is_not_safe_to_retry(
+        http_transport, auth):
+    """The connection was established and the request may already have
+    reached the panel: it may have armed the house. Handing that command to
+    another transport would arm it twice."""
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjk5OTk5OTk5OTl9.x"
+    with aioresponses() as m:
+        m.post("https://1.2.3.4/api/v2/login", payload={"token": f"JWT {jwt}"})
+        m.post("https://1.2.3.4/api/v2/cmd/eid/4",
+               exception=aiohttp.ServerDisconnectedError())
+        await http_transport.async_start(auth, lambda d: None)
+        result = await http_transport.async_send_command("eid", "4")
+
+    assert result.ok is False
+    assert result.safe_to_retry is False, (
+        "a connection lost mid-request was reported as 'the panel never "
+        "got it'"
+    )
+
+
+async def test_a_refused_connection_is_still_safe_to_retry(
+        http_transport, auth):
+    """The other half of the same rule: a connection that was never
+    established proves the panel did nothing, and the command must be free
+    to go out on another transport."""
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjk5OTk5OTk5OTl9.x"
+    with aioresponses() as m:
+        m.post("https://1.2.3.4/api/v2/login", payload={"token": f"JWT {jwt}"})
+        m.post("https://1.2.3.4/api/v2/cmd/eid/4",
+               exception=aiohttp.ClientConnectorError(
+                   MagicMock(ssl=None, host="1.2.3.4", port=443),
+                   OSError(111, "Connection refused")))
+        await http_transport.async_start(auth, lambda d: None)
+        result = await http_transport.async_send_command("eid", "4")
+
+    assert result.ok is False
+    assert result.safe_to_retry is True
